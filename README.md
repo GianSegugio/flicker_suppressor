@@ -5,6 +5,7 @@ Single-image/batch restoration for rolling-shutter flicker/banding under tempora
 Flicker Suppressor runs locally. Images are not uploaded anywhere by the program.
 
 The project includes a PySide6 desktop application for interactive single-image and batch workflows, plus the full command-line interface for scripting, batch processing, and advanced parameters.
+
 ![Flicker Suppressor: desktop application.](img/screenshots/GUI_01.png)
 
 ## Example
