@@ -29,6 +29,7 @@ if (Test-Path .\build) { Remove-Item -Recurse -Force .\build }
     --include-package=numpy `
     --include-package=PIL `
     --include-package=einops `
+    --include-module=autosettings `
     --include-data-dir=.\models=models `
     --include-data-dir=.\assets=assets `
     --include-data-file=.\README.md=README.md `

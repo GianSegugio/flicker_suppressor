@@ -409,6 +409,9 @@ class ModernComboBox(_ModernRightControlFrame):
     def setCurrentIndex(self, index: int): self._editor.setCurrentIndex(index)
     def currentIndex(self) -> int: return self._editor.currentIndex()
     def count(self) -> int: return self._editor.count()
+    def clear(self): self._editor.clear()
+    def itemData(self, index: int): return self._editor.itemData(index)
+    def itemText(self, index: int) -> str: return self._editor.itemText(index)
 
 
 class EyeToggleButton(QToolButton):

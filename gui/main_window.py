@@ -15,12 +15,12 @@ from PySide6.QtWidgets import (
 from .app_paths import load_state, resource_path, save_state
 from .engine import FlickerEngine
 from .device_options import device_options
-from .settings_schema import GROUP_ORDER, canonical_cutoff, cutoff_luma, default_settings, namespace, specs
+from .settings_schema import GROUP_ORDER, canonical_cutoff, cutoff_luma, default_settings, namespace, specs, validate_imported_settings
 from .widgets import (
     ClipStripItem, ComparisonCanvas, DownChevronButton, EyeToggleButton, ImageStrip, ModernComboBox,
     ModernDoubleSpinBox, ModernSpinBox, ResetButton, ResettableSlider,
 )
-from .workers import CopyWorker, InferenceWorker
+from .workers import AutoSettingsWorker, CopyWorker, InferenceWorker
 
 IMAGE_FILTER='Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp)'
 SUPPORTED_IMAGE_EXTS={'.png','.jpg','.jpeg','.bmp','.tif','.tiff','.webp'}
@@ -39,6 +39,13 @@ class ImageDocument:
     processing: bool=False
     masks: dict[str,QImage]=field(default_factory=dict)
     mask_authored: set[str]=field(default_factory=set)
+    # Auto-settings estimate for this image, or None if not run / still running.
+    # Holds confidence, reason, period_px, and the ranked candidates list the
+    # period dropdown will read.
+    auto: dict|None=None
+    # The "could not be determined" popup is shown once per image, on first
+    # selection, not on every reselect.
+    auto_notified: bool=False
 
 
 @dataclass
@@ -187,6 +194,94 @@ class ExportOverlay(QWidget):
 
     def keyPressEvent(self,event):
         # Consume keyboard input while the rest of the window is locked.
+        event.accept()
+
+
+class AutoSettingsOverlay(QWidget):
+    """Busy overlay shown while band settings are being estimated.
+
+    Visually identical to ExportOverlay, with two differences: no Cancel
+    button, and it lets file drops through. Importing more images is the one
+    thing a user is likely to want while a batch is being analysed, so the
+    overlay accepts drops itself and re-emits them on the same signal the
+    filmstrip and canvas use.
+    """
+    droppedPaths=Signal(list)
+
+    def __init__(self,parent=None):
+        super().__init__(parent)
+        self.setObjectName('AutoSettingsOverlay')
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground,True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setAcceptDrops(True)
+        self.setStyleSheet("""
+            QWidget#AutoSettingsOverlay { background:rgba(18,19,22,205); }
+            QFrame#AutoSettingsOverlayCard { background:#292b2f; border:1px solid #4a4d53; border-radius:8px; }
+            QLabel#AutoSettingsOverlayLabel { background:transparent; font-size:12pt; font-weight:600; }
+        """)
+        outer=QVBoxLayout(self)
+        outer.setContentsMargins(20,20,20,20)
+        outer.addStretch(1)
+        card=QFrame()
+        card.setObjectName('AutoSettingsOverlayCard')
+        # Wider than ExportOverlay's 290 so the longer message fits on one line.
+        # Wrapping was tried twice and clipped both times: QVBoxLayout ignores a
+        # QLabel's heightForWidth unless its size policy opts in, so the card
+        # kept sizing itself to a single line regardless.
+        card.setFixedWidth(420)
+        lay=QVBoxLayout(card)
+        lay.setContentsMargins(28,24,28,24)
+        lay.setSpacing(14)
+        self.spinner=SpinnerWidget()
+        lay.addWidget(self.spinner,0,Qt.AlignmentFlag.AlignHCenter)
+        label=QLabel('Determining essential editing settings...')
+        label.setObjectName('AutoSettingsOverlayLabel')
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(label)
+        outer.addWidget(card,0,Qt.AlignmentFlag.AlignCenter)
+        outer.addStretch(1)
+        self.hide()
+
+    @staticmethod
+    def _local_paths_from_mime(mime):
+        if not mime or not mime.hasUrls():
+            return []
+        out=[]
+        for url in mime.urls():
+            if url.isLocalFile():
+                p=url.toLocalFile()
+                if p:
+                    out.append(p)
+        return out
+
+    def dragEnterEvent(self,event):
+        if self._local_paths_from_mime(event.mimeData()):
+            event.acceptProposedAction(); return
+        event.ignore()
+
+    def dragMoveEvent(self,event):
+        if self._local_paths_from_mime(event.mimeData()):
+            event.acceptProposedAction(); return
+        event.ignore()
+
+    def dropEvent(self,event):
+        paths=self._local_paths_from_mime(event.mimeData())
+        if paths:
+            self.droppedPaths.emit(paths)
+            event.acceptProposedAction(); return
+        event.ignore()
+
+    def showEvent(self,event):
+        self.spinner.start()
+        self.setFocus(Qt.FocusReason.OtherFocusReason)
+        super().showEvent(event)
+
+    def hideEvent(self,event):
+        self.spinner.stop()
+        super().hideEvent(event)
+
+    def keyPressEvent(self,event):
+        # Consume keyboard input while the window is locked.
         event.accept()
 
 
@@ -383,6 +478,7 @@ class SettingsPanel(QFrame):
     changed = Signal(str,object)
     activationChanged = Signal(bool)
     exportSettingsRequested = Signal()
+    importSettingsRequested = Signal()
     maskModeChanged = Signal(str,bool)
     maskBrushChanged = Signal(str,object)
     maskCopyRequested = Signal(str)
@@ -479,22 +575,34 @@ class SettingsPanel(QFrame):
                 group_lay.addWidget(stack)
             lay.addWidget(box)
 
-        # Developer utility: export the exact complete inference settings that
-        # would be used for the current image. This intentionally lives after
-        # Broad residual cleanup and is not part of the CLI-backed spec list.
-        export_box=QGroupBox('Export settings (dev)')
+        # Developer utility: export/import the exact complete inference settings
+        # used for the current image. This intentionally lives after Broad
+        # residual cleanup and is not part of the CLI-backed spec list.
+        export_box=QGroupBox('Export/import settings (dev)')
         export_box.setMinimumWidth(0)
         export_box.setSizePolicy(QSizePolicy.Policy.Expanding,QSizePolicy.Policy.Preferred)
         export_lay=QVBoxLayout(export_box)
         export_lay.setContentsMargins(10,12,10,9)
         export_lay.setSpacing(8)
+        button_row=QWidget()
+        button_lay=QVBoxLayout(button_row)
+        button_lay.setContentsMargins(0,0,0,0)
+        button_lay.setSpacing(6)
         self.export_settings_button=QPushButton('Export json')
         self.export_settings_button.setToolTip(
             'Export all processing settings for the current image as JSON, '
             'including settings that are hidden from the GUI.'
         )
         self.export_settings_button.clicked.connect(self.exportSettingsRequested.emit)
-        export_lay.addWidget(self.export_settings_button)
+        button_lay.addWidget(self.export_settings_button,1)
+        self.import_settings_button=QPushButton('Import json')
+        self.import_settings_button.setToolTip(
+            'Import processing settings from a Flicker Suppressor JSON export. '
+            'The file is validated before any settings are applied. Masks are not imported.'
+        )
+        self.import_settings_button.clicked.connect(self.importSettingsRequested.emit)
+        button_lay.addWidget(self.import_settings_button,1)
+        export_lay.addWidget(button_row)
         lay.addWidget(export_box)
 
         lay.addStretch(1)
@@ -595,7 +703,18 @@ class SettingsPanel(QFrame):
                 with QSignalBlocker(w._period_spin):
                     w._period_spin.setValue(1.0)
             with QSignalBlocker(w._period_auto):
-                w._period_auto.setChecked(period <= 0.0)
+                idx=0 if period <= 0.0 else -1
+                if period > 0:
+                    # Match a listed candidate within 0.5%; otherwise Custom.
+                    for i in range(w._period_auto.count()):
+                        data=w._period_auto.itemData(i)
+                        if data is not None and float(data) > 0 and abs(float(data)/period-1.0) < 0.005:
+                            idx=i
+                            break
+                    if idx < 0:
+                        idx=w._period_auto.count()-1      # Custom is always last
+                w._period_auto.setCurrentIndex(max(0,idx))
+            w._period_spin.setEnabled(w.isEnabled() and w._period_auto.currentData() is None)
             return
         if hasattr(w,'_cutoff'):
             fallback='#000000' if d=='flat_highpass' else '#FFFFFF'
@@ -698,7 +817,9 @@ class SettingsPanel(QFrame):
             v=QVBoxLayout(wrap)
             v.setContentsMargins(0,0,0,0)
             v.setSpacing(5)
-            auto=QCheckBox('Auto')
+            auto=ModernComboBox()
+            auto.setSizePolicy(QSizePolicy.Policy.Expanding,QSizePolicy.Policy.Fixed)
+            auto.setMinimumWidth(0)
             spin=ModernDoubleSpinBox()
             spin.setSizePolicy(QSizePolicy.Policy.Expanding,QSizePolicy.Policy.Fixed)
             spin.setRange(1,7680)
@@ -710,22 +831,26 @@ class SettingsPanel(QFrame):
             wrap._period_auto=auto
             wrap._period_spin=spin
             wrap._last_manual_period=1.0
+            wrap._period_candidates=[]
 
-            def auto_toggled(checked, w=wrap, d=sp.dest):
-                if checked:
-                    w._last_manual_period=max(1.0,float(w._period_spin.value()))
-                else:
+            def mode_changed(_idx, w=wrap, d=sp.dest):
+                data=w._period_auto.currentData()
+                if data is None:                       # Custom: user drives the spin
                     with QSignalBlocker(w._period_spin):
                         w._period_spin.setValue(max(1.0,min(7680.0,float(w._last_manual_period or 1.0))))
-                w._period_spin.setEnabled(w.isEnabled() and not checked)
+                elif float(data) > 0:                  # a candidate
+                    with QSignalBlocker(w._period_spin):
+                        w._period_spin.setValue(max(1.0,min(7680.0,float(data))))
+                w._period_spin.setEnabled(w.isEnabled() and data is None)
                 self._emit(d)
 
             def period_changed(value, w=wrap, d=sp.dest):
                 w._last_manual_period=max(1.0,min(7680.0,float(value)))
                 self._emit(d)
 
-            auto.toggled.connect(auto_toggled)
+            auto.currentIndexChanged.connect(mode_changed)
             spin.valueChanged.connect(period_changed)
+            self._rebuild_period_items(wrap,[])
             return wrap
         if sp.dest in {'flat_highpass','flat_lowpass'}:
             wrap=QWidget()
@@ -764,6 +889,16 @@ class SettingsPanel(QFrame):
             for option in device_options():
                 w.addItem(option.label,option.value)
             w.currentIndexChanged.connect(lambda _=0,d=sp.dest:self._emit(d)); return w
+        if sp.dest == 'flat_profile_mode':
+            w=ModernComboBox(); w.setMinimumWidth(0); w.setSizePolicy(QSizePolicy.Policy.Expanding,QSizePolicy.Policy.Fixed)
+            w.addItem('Smooth periodic','smooth')
+            w.addItem('PWM / Step','pwm')
+            w.currentIndexChanged.connect(lambda _=0,d=sp.dest:self._emit(d)); return w
+        if sp.dest == 'flat_surface_equalizer_mode':
+            w=ModernComboBox(); w.setMinimumWidth(0); w.setSizePolicy(QSizePolicy.Policy.Expanding,QSizePolicy.Policy.Fixed)
+            w.addItem('Dominant surface','dominant')
+            w.addItem('Multi-surface consensus','consensus')
+            w.currentIndexChanged.connect(lambda _=0,d=sp.dest:self._emit(d)); return w
         if sp.choices:
             w=ModernComboBox(); w.setMinimumWidth(0); w.setSizePolicy(QSizePolicy.Policy.Expanding,QSizePolicy.Policy.Fixed); [w.addItem(str(x),x) for x in sp.choices]; w.currentIndexChanged.connect(lambda _=0,d=sp.dest:self._emit(d)); return w
         if sp.value_type is int:
@@ -772,6 +907,8 @@ class SettingsPanel(QFrame):
                 w.setRange(256,2048); w.setSingleStep(8); w.editingFinished.connect(lambda box=w:self._normalize_processing_size(box))
             elif sp.dest == 'flat_local_edge_distance':
                 w.setRange(0,100); w.setSingleStep(1)
+            elif sp.dest == 'flat_profile_pwm_polish_passes':
+                w.setRange(1,3); w.setSingleStep(1)
             else:
                 w.setRange(-1000000,1000000)
             w.valueChanged.connect(lambda _=0,d=sp.dest:self._emit(d)); return w
@@ -790,14 +927,18 @@ class SettingsPanel(QFrame):
                 sl=ResettableSlider(Qt.Orientation.Horizontal)
                 sl.setObjectName('FlatSlider')
                 slider_ranges={
+                    'first_pass_luma_strength': (0.0,2.0),
+                    'first_pass_chroma_strength': (0.0,2.0),
                     'second_pass_strength': (0.0,2.0),
-                    'highlight_recovery_strength': (0.0,1.0),
                     'flat_luma_strength': (0.0,2.0),
                     'flat_chroma_strength': (0.0,2.0),
                     'flat_profile_luma_strength': (0.0,4.0),
                     'flat_profile_chroma_strength': (0.0,4.0),
+                    'flat_profile_pwm_polish_strength': (0.0,1.25),
                     'orthogonal_profile_luma_strength': (-1.0,4.0),
                     'orthogonal_profile_chroma_strength': (-1.0,4.0),
+                    'flat_surface_equalizer_luma_strength': (0.0,2.0),
+                    'flat_surface_equalizer_chroma_strength': (0.0,2.0),
                 }
                 lo,hi=slider_ranges.get(sp.dest,(-2.0,4.0))
                 sl.setRange(int(round(lo*100)),int(round(hi*100)))
@@ -822,7 +963,10 @@ class SettingsPanel(QFrame):
     def value(self,d):
         w=self.widgets[d]
         if hasattr(w,'_period_auto'):
-            return 0.0 if w._period_auto.isChecked() else float(w._period_spin.value())
+            data=w._period_auto.currentData()
+            if data is None:
+                return float(w._period_spin.value())    # Custom
+            return float(data)                          # 0.0 for Auto, else the candidate
         if hasattr(w,'_cutoff'): return w._line.text().strip()
         if hasattr(w,'_spin'): return float(w._spin.value())
         if isinstance(w,QCheckBox): return w.isChecked()
@@ -830,6 +974,56 @@ class SettingsPanel(QFrame):
         if isinstance(w,(ModernSpinBox,QSpinBox)): return int(w.value())
         if isinstance(w,(ModernDoubleSpinBox,QDoubleSpinBox)): return float(w.value())
         return w.text()
+    def _rebuild_period_items(self,w,candidates):
+        """Repopulate Auto / candidates / Custom, preserving the current value."""
+        current=None
+        if w._period_auto.count():
+            current=w._period_auto.currentData()
+        with QSignalBlocker(w._period_auto):
+            w._period_auto.clear()
+            w._period_auto.addItem('Auto',0.0)
+            for c in (candidates or []):
+                try:
+                    per=float(c.get('period_px'))
+                except (TypeError,ValueError):
+                    continue
+                if per <= 0:
+                    continue
+                cyc=c.get('cycles')
+                rel=str(c.get('relation') or '')
+                bits=[]
+                if cyc:
+                    bits.append(f'{float(cyc):g} cycles')
+                if rel=='harmonic':
+                    bits.append('harmonic')
+                elif rel=='independent':
+                    bits.append('alt')
+                suffix=f"  ({', '.join(bits)})" if bits else ''
+                w._period_auto.addItem(f'{per:g} px{suffix}',per)
+            w._period_auto.addItem('Custom...',None)
+            idx=0
+            if current is None and w._period_auto.count():
+                idx=w._period_auto.count()-1
+            elif current is not None:
+                found=w._period_auto.findData(current)
+                idx=found if found >= 0 else 0
+            w._period_auto.setCurrentIndex(max(0,idx))
+        w._period_candidates=list(candidates or [])
+        w._period_spin.setEnabled(w.isEnabled() and w._period_auto.currentData() is None)
+
+    def set_period_candidates(self,candidates):
+        """Feed the estimator's ranked periods into the dropdown.
+
+        Called when a document becomes current and again when its estimate
+        arrives. Passing None or [] leaves just Auto and Custom.
+        """
+        w=self.widgets.get('flat_profile_band_period')
+        if w is None or not hasattr(w,'_period_auto'):
+            return
+        value=self.value('flat_profile_band_period')
+        self._rebuild_period_items(w,candidates)
+        self._set_widget_value('flat_profile_band_period',w,value)
+
     def load(self,values,activated=False):
         with QSignalBlocker(self.activation_checkbox):
             self.activation_checkbox.setChecked(bool(activated))
@@ -846,8 +1040,11 @@ class SettingsPanel(QFrame):
         self.scroll.setEnabled(bool(can_edit))
 
     def update_dependencies(self):
+        restormer=bool(self.value('restormer')) if 'restormer' in self.widgets else True
         ff=bool(self.value('flat_filter')) if 'flat_filter' in self.widgets else False
         fp=bool(self.value('flat_profile')) if 'flat_profile' in self.widgets else False
+        profile_mode=str(self.value('flat_profile_mode')).lower() if 'flat_profile_mode' in self.widgets else 'smooth'
+        pwm_profile = fp and profile_mode == 'pwm'
         feq=bool(self.value('flat_surface_equalizer')) if 'flat_surface_equalizer' in self.widgets else False
         orth=bool(self.value('orthogonal_profile')) if 'orthogonal_profile' in self.widgets else False
         device=str(self.value('device')).lower() if 'device' in self.widgets else 'auto'
@@ -860,25 +1057,49 @@ class SettingsPanel(QFrame):
             btn.setEnabled(bool(stage_enabled.get(stage,False) or self._active_mask_stage==stage))
         for d,w in self.widgets.items():
             enabled=True
-            # AMP is meaningful only when CUDA is selected explicitly or may be
-            # selected by Auto.  Preserve its checked state while disabled.
-            if d=='amp': enabled=(device=='auto' or device.startswith('cuda'))
+            # Restormer-only controls follow the master Restormer switch, just
+            # like the controls in the optional deterministic cleanup sections.
+            # Band direction intentionally remains editable because the residual
+            # profile / broad cleanup paths use the same axis even when the
+            # neural Restormer stage is disabled.
+            if d in {
+                'device','amp','processing_size','passes',
+                'first_pass_luma_strength','first_pass_chroma_strength',
+                'second_pass_strength','luma_mode',
+            }:
+                enabled=restormer
+            # AMP is meaningful only when Restormer is enabled and CUDA is
+            # selected explicitly or may be selected by Auto. Preserve its
+            # checked state while disabled.
+            if d=='amp': enabled=restormer and (device=='auto' or device.startswith('cuda'))
             # Local surface safety only controls the local flat-region blend.
             if d in {'flat_luma_strength','flat_chroma_strength','flat_local_edge_distance'}: enabled=ff
             # Tone cutoffs are shared support gates for all deterministic cleanup
             # paths, so they remain editable when any such cleanup is active.
             if d in {'flat_highpass','flat_lowpass'}: enabled=any_cleanup
             # Main residual-profile controls depend only on their own enable flag.
+            # Profile mode is shared with the optional orthogonal pass, so keep
+            # that one selector editable when either residual-profile path runs.
             if d.startswith('flat_profile_'): enabled=fp
+            # Final PWM polish is meaningful only for PWM / Step residual mode.
+            # Keep the user's checked state while disabled, matching the other
+            # optional sections, but never allow the polish controls to become
+            # interactive when Smooth periodic is selected.
+            if d == 'flat_profile_pwm_polish':
+                enabled = pwm_profile
+            if d in {'flat_profile_pwm_polish_strength','flat_profile_pwm_polish_passes'} and 'flat_profile_pwm_polish' in self.widgets:
+                enabled = pwm_profile and bool(self.value('flat_profile_pwm_polish'))
+            if d=='flat_profile_mode': enabled=(fp or orth)
             # Orthogonal cleanup shares the residual-profile algorithm but is
             # independently opt-in. Its strength controls follow its checkbox.
             if d.startswith('orthogonal_') and d!='orthogonal_profile': enabled=orth
-            if d=='second_pass_strength': enabled=(passes==2)
+            if d in {'flat_surface_equalizer_mode','flat_surface_equalizer_luma_strength','flat_surface_equalizer_chroma_strength'}: enabled=feq
+            if d=='second_pass_strength': enabled=restormer and (passes==2)
             w.setEnabled(enabled)
             if d in self.reset_buttons:
                 self.reset_buttons[d].setEnabled(enabled)
             if hasattr(w,'_period_auto'):
-                w._period_spin.setEnabled(enabled and not w._period_auto.isChecked())
+                w._period_spin.setEnabled(enabled and w._period_auto.currentData() is None)
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -891,6 +1112,8 @@ class MainWindow(QMainWindow):
         self._preview_processing_ids=set()
         self._build_ui(); self._build_menus()
         self.export_overlay=ExportOverlay(self); self.export_overlay.cancelRequested.connect(self.cancel_export)
+        self.auto_overlay=AutoSettingsOverlay(self); self.auto_overlay.droppedPaths.connect(self.add_paths)
+        self._auto_pending=0
         self.processing_overlay=ProcessingOverlay(self.canvas); self.processing_overlay.setGeometry(self.canvas.rect())
         self._update_recent(); self.update_ui_state()
     def _build_ui(self):
@@ -909,6 +1132,10 @@ class MainWindow(QMainWindow):
         self.btn_fit=QToolButton(); self.btn_fit.setText('Fit'); self.btn_fit.clicked.connect(self.canvas.fit); self.btn_100=QToolButton(); self.btn_100.setText('100%'); self.btn_100.clicked.connect(self.canvas.zoom_100)
         self.btn_minus=QToolButton(); self.btn_minus.setText('−'); self.btn_minus.clicked.connect(lambda:self.canvas.set_zoom((self.canvas.zoom or .5)/1.2)); self.btn_plus=QToolButton(); self.btn_plus.setText('+'); self.btn_plus.clicked.connect(lambda:self.canvas.set_zoom((self.canvas.zoom or .5)*1.2))
         self.zoom_label=QLabel('Fit'); self.zoom_label.setObjectName('Muted'); self.zoom_label.setFixedWidth(48); self.zoom_label.setAlignment(Qt.AlignmentFlag.AlignCenter); self.canvas.zoomChanged.connect(lambda z:self.zoom_label.setText('Fit' if z<=0 else f'{z*100:.0f}%'))
+        # Pixel dimensions of the image currently on the canvas. Fixed width and
+        # right alignment so the zoom buttons beside it do not shift as the
+        # number of digits changes.
+        self.resolution_label=QLabel(''); self.resolution_label.setObjectName('Muted'); self.resolution_label.setFixedWidth(180); self.resolution_label.setAlignment(Qt.AlignmentFlag.AlignRight|Qt.AlignmentFlag.AlignVCenter)
         # Keep Single + eye as one tight visual group, then separate the
         # other comparison modes so they read as distinct choices.
         th.addWidget(self.btn_single)
@@ -918,11 +1145,13 @@ class MainWindow(QMainWindow):
         th.addSpacing(12)
         th.addWidget(self.btn_side)
         th.addStretch(1)
-        # Zoom controls: Fit, 100%, minus, plus.
+        # Resolution readout, then zoom controls: Fit, 100%, minus, plus.
+        th.addWidget(self.resolution_label)
+        th.addSpacing(12)
         for w in [self.btn_fit,self.btn_100,self.btn_minus,self.btn_plus,self.zoom_label]: th.addWidget(w)
         canvas_col.addWidget(toolbar)
         cwrap=QWidget(); cwrap.setLayout(canvas_col); middle.addWidget(cwrap,1)
-        self.settings_panel=SettingsPanel(); self.settings_panel.setFixedWidth(340); self.settings_panel.changed.connect(self.setting_changed); self.settings_panel.activationChanged.connect(self.activation_changed); self.settings_panel.exportSettingsRequested.connect(self.export_current_settings_json); self.settings_panel.maskModeChanged.connect(self.mask_mode_changed); self.settings_panel.maskBrushChanged.connect(self.mask_brush_changed); self.settings_panel.maskCopyRequested.connect(self.copy_stage_mask); self.settings_panel.maskPasteRequested.connect(self.paste_stage_mask); self.settings_panel.maskInvertRequested.connect(self.invert_stage_mask); self.canvas.maskEdited.connect(self.mask_edited); middle.addWidget(self.settings_panel)
+        self.settings_panel=SettingsPanel(); self.settings_panel.setFixedWidth(340); self.settings_panel.changed.connect(self.setting_changed); self.settings_panel.activationChanged.connect(self.activation_changed); self.settings_panel.exportSettingsRequested.connect(self.export_current_settings_json); self.settings_panel.importSettingsRequested.connect(self.import_current_settings_json); self.settings_panel.maskModeChanged.connect(self.mask_mode_changed); self.settings_panel.maskBrushChanged.connect(self.mask_brush_changed); self.settings_panel.maskCopyRequested.connect(self.copy_stage_mask); self.settings_panel.maskPasteRequested.connect(self.paste_stage_mask); self.settings_panel.maskInvertRequested.connect(self.invert_stage_mask); self.canvas.maskEdited.connect(self.mask_edited); middle.addWidget(self.settings_panel)
         main.addLayout(middle,1)
         bottom=QFrame(); bottom.setObjectName('BottomBar'); bh=QHBoxLayout(bottom); bh.setContentsMargins(8,7,8,7); bh.setSpacing(8)
         self.strip=ImageStrip(); self.strip.setObjectName('ImageStrip'); self.strip.setFixedHeight(108); self.strip.currentItemChanged.connect(self.current_item_changed); self.strip.itemSelectionChanged.connect(self.update_ui_state); self.strip.emptyContextRequested.connect(self.show_strip_context_menu); self.strip.itemContextRequested.connect(self.show_clip_context_menu); self.strip.droppedPaths.connect(self.add_paths); bh.addWidget(self.strip,1)
@@ -939,6 +1168,11 @@ class MainWindow(QMainWindow):
         self.act_open=file.addAction('Open images...'); self.act_open.setShortcut(QKeySequence.StandardKey.Open); self.act_open.triggered.connect(self.open_images)
         self.menu_recent=file.addMenu('Open recent'); file.addSeparator(); self.act_close_sel=file.addAction('Close selected'); self.act_close_sel.triggered.connect(self.close_selected); self.act_close_all=file.addAction('Close all'); self.act_close_all.triggered.connect(self.close_all); file.addSeparator(); self.act_exp_sel=file.addAction('Export selected...'); self.act_exp_sel.triggered.connect(self.export_selected); self.act_exp_all=file.addAction('Export all...'); self.act_exp_all.triggered.connect(self.export_all); file.addSeparator(); file.addAction('Exit',self.close)
         self.act_copy=edit.addAction('Copy editing settings from selected'); self.act_copy.setShortcut(QKeySequence.StandardKey.Copy); self.act_copy.triggered.connect(self.copy_settings); self.act_paste=edit.addAction('Paste editing settings to selected'); self.act_paste.setShortcut(QKeySequence.StandardKey.Paste); self.act_paste.triggered.connect(self.paste_settings)
+        edit.addSeparator()
+        self.act_auto_settings=edit.addAction('Essential editing settings'); self.act_auto_settings.setCheckable(True)
+        self.act_auto_settings.setChecked(bool(self.state.get('auto_editing_settings',True)))
+        self.act_auto_settings.setToolTip('Determine the essential settings - band axis, period and cleanup mode - when an image is imported')
+        self.act_auto_settings.toggled.connect(self._auto_settings_toggled)
         self.act_select_all=select.addAction('Select all'); self.act_select_all.setShortcut(QKeySequence.StandardKey.SelectAll); self.act_select_all.triggered.connect(self.select_all)
         self.act_deselect_all=select.addAction('Deselect all'); self.act_deselect_all.setShortcut(QKeySequence('Ctrl+Shift+A')); self.act_deselect_all.triggered.connect(self.deselect_all)
         self.act_fit=view.addAction('Zoom to fit'); self.act_fit.triggered.connect(self.canvas.fit); self.act_100=view.addAction('Zoom to 100%'); self.act_100.triggered.connect(self.canvas.zoom_100); view.addSeparator(); self.act_single=view.addAction('Single view'); self.act_single.triggered.connect(lambda:self.set_view('single')); self.act_split=view.addAction('Split view'); self.act_split.triggered.connect(lambda:self.set_view('split')); self.act_side=view.addAction('Side by side view'); self.act_side.triggered.connect(lambda:self.set_view('side'))
@@ -995,6 +1229,8 @@ class MainWindow(QMainWindow):
             scaled=pm.scaled(72,54,Qt.AspectRatioMode.KeepAspectRatio,Qt.TransformationMode.SmoothTransformation)
             painter=QPainter(thumb); painter.drawPixmap((72-scaled.width())//2,(54-scaled.height())//2,scaled); painter.end()
             item.setThumbnail(thumb); item.setToolTip(str(p)); self.strip.addItem(item); new_items.append(item)
+            if self.act_auto_settings.isChecked():
+                self._queue_auto_settings(doc)
             ps=str(p); self.recent=[ps]+[x for x in self.recent if x!=ps]; self.recent=self.recent[:12]
         self.state['recent']=self.recent; save_state(self.state); self._update_recent()
         if new_items:
@@ -1034,11 +1270,99 @@ class MainWindow(QMainWindow):
         # ImageStrip paints a crisp red frame on the current tile.
         self.current_id=item.data(Qt.ItemDataRole.UserRole) if item else None; d=self.current_doc()
         if d:
+            self.settings_panel.set_period_candidates((getattr(d,'auto',None) or {}).get('candidates'))
             self.settings_panel.load(d.settings,d.activated); self.load_canvas(d)
-        else:self.canvas.set_images(None,None)
+            self._maybe_warn_auto_settings(d)
+        else:
+            self.canvas.set_images(None,None); self._update_resolution_label(None)
         self.update_ui_state()
+    def _auto_settings_toggled(self,checked):
+        self.state['auto_editing_settings']=bool(checked); save_state(self.state)
+
+    def _queue_auto_settings(self,doc):
+        """Estimate settings for one freshly imported image, off the UI thread."""
+        worker=AutoSettingsWorker(doc.id,doc.path)
+        worker.signals.finished.connect(self._auto_settings_ready)
+        worker.signals.error.connect(self._auto_settings_failed)
+        self._auto_pending+=1
+        self._sync_auto_overlay()
+        self.thread_pool.start(worker)
+
+    def _sync_auto_overlay(self):
+        """Show while any estimate is outstanding, hide when the last finishes."""
+        if self._auto_pending > 0:
+            self.auto_overlay.setGeometry(self.rect())
+            self.auto_overlay.show()
+            self.auto_overlay.raise_()
+        else:
+            self.auto_overlay.hide()
+
+    def _auto_settings_done(self):
+        self._auto_pending=max(0,self._auto_pending-1)
+        self._sync_auto_overlay()
+
+    def _auto_settings_failed(self,doc_id,_msg):
+        # An estimate that crashes must not block the image. Treat it as "could
+        # not determine" and fall through to defaults.
+        d=self.docs.get(doc_id)
+        if d is not None:
+            d.auto={'confidence':'low','reason':'the estimator failed on this image',
+                    'candidates':[],'settings':{}}
+        self._auto_settings_done()
+
+    def _auto_settings_ready(self,doc_id,_src,result):
+        self._auto_settings_done()
+        d=self.docs.get(doc_id)
+        if d is None or not isinstance(result,dict):
+            return
+        d.auto=result
+        if d.dirty or d.processing:
+            # The user has already edited or is mid-render; do not overwrite.
+            return
+        if result.get('confidence')=='low':
+            # Defaults, not the previous image's settings: carrying a period
+            # tuned for another photo across is worse than starting neutral.
+            d.settings=dict(default_settings())
+        else:
+            merged=dict(d.settings); merged.update(result.get('settings') or {})
+            d.settings=merged
+        if d.id==self.current_id:
+            self.settings_panel.set_period_candidates(result.get('candidates'))
+            self.settings_panel.load(d.settings,d.activated)
+            self._maybe_warn_auto_settings(d)
+
+    def _maybe_warn_auto_settings(self,d):
+        """Once per image, tell the user the estimate was inconclusive."""
+        if d.auto is None or d.auto_notified:
+            return
+        if d.auto.get('confidence')!='low':
+            return
+        d.auto_notified=True
+        box=QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle('Essential editing settings')
+        box.setText('Essential editing settings could not be determined for the current image')
+        # The estimator's reason is diagnostic ("colour ratios disagree by
+        # 5.71x") and unhelpful to someone deciding what to do next. It stays in
+        # doc.auto['reason'] for the CLI and for logs.
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.exec()
+
     def load_canvas(self,d):
         orig=QImage(str(d.path)); edit=QImage(str(d.preview_path)) if d.preview_path and d.preview_path.exists() else QImage(); self.canvas.set_images(orig,edit)
+        self._update_resolution_label(orig)
+
+    def _update_resolution_label(self,image=None):
+        """Show the source pixel dimensions of the image on the canvas.
+
+        Source rather than preview: preview and export are full resolution so
+        the two agree, but reading the source means the label is right before a
+        preview exists and does not change while one is being rendered.
+        """
+        if image is None or image.isNull():
+            self.resolution_label.setText('')
+            return
+        self.resolution_label.setText(f'Resolution: {image.width()} x {image.height()} px')
     def set_view(self,mode):
         if self.settings_panel.active_mask_stage and mode!='single':
             return
@@ -1302,6 +1626,67 @@ class MainWindow(QMainWindow):
             target.write_text(json.dumps(payload,indent=2,ensure_ascii=False)+'\n',encoding='utf-8')
         except Exception as exc:
             QMessageBox.critical(self,'Export settings',f'Could not export settings:\n{exc}')
+
+    def import_current_settings_json(self):
+        d=self.current_doc()
+        if not d or not d.activated or d.processing or self._export_active():
+            return
+
+        filename,_=QFileDialog.getOpenFileName(
+            self,
+            'Import processing settings',
+            str(d.path.parent),
+            'JSON files (*.json);;All files (*)',
+        )
+        if not filename:
+            return
+        source=Path(filename)
+        try:
+            text=source.read_text(encoding='utf-8-sig')
+        except Exception as exc:
+            QMessageBox.critical(self,'Import settings',f'Could not read settings file:\n{exc}')
+            return
+        try:
+            payload=json.loads(text)
+        except json.JSONDecodeError as exc:
+            QMessageBox.critical(
+                self,
+                'Import settings',
+                f'Invalid JSON at line {exc.lineno}, column {exc.colno}:\n{exc.msg}',
+            )
+            return
+        except Exception as exc:
+            QMessageBox.critical(self,'Import settings',f'Could not parse JSON:\n{exc}')
+            return
+
+        try:
+            imported=dict(validate_imported_settings(payload))
+        except ValueError as exc:
+            QMessageBox.critical(
+                self,
+                'Import settings',
+                'This file is not a valid Flicker Suppressor processing-settings JSON.\n\n'
+                f'{exc}',
+            )
+            return
+        except Exception as exc:
+            QMessageBox.critical(self,'Import settings',f'Could not validate settings:\n{exc}')
+            return
+
+        if self.settings_panel.active_mask_stage:
+            self.settings_panel.exit_mask_mode()
+
+        # Developer JSON contains processing values only. Preserve any authored
+        # masks already attached to this image, but ensure newly enabled masked
+        # stages have a full-coverage mask if no authored mask exists yet.
+        d.settings=imported
+        for setting,stage in MASK_STAGE_SETTING.items():
+            if bool(d.settings.get(setting,False)):
+                self._ensure_full_stage_mask(d,stage)
+        d.dirty=True
+        self.settings_panel.load(d.settings,d.activated)
+        self.load_canvas(d)
+        self.update_ui_state()
 
     def preview_current(self):
         d=self.current_doc()
@@ -1727,6 +2112,10 @@ class MainWindow(QMainWindow):
             self.export_overlay.setGeometry(self.rect())
             if self.export_overlay.isVisible():
                 self.export_overlay.raise_()
+        if hasattr(self,'auto_overlay'):
+            self.auto_overlay.setGeometry(self.rect())
+            if self.auto_overlay.isVisible():
+                self.auto_overlay.raise_()
 
     def closeEvent(self,event):
         if self._export_active():

@@ -77,46 +77,7 @@ def autocast(device: torch.device, enabled: bool):
     return torch.autocast("cuda", dtype=torch.float16) if enabled and device.type == "cuda" else contextlib.nullcontext()
 
 
-def apply_highlight_recovery(
-    processed: torch.Tensor,
-    reference: torch.Tensor,
-    *,
-    strength: float = 0.75,
-    start: float = 0.90,
-    full: float = 0.99,
-) -> tuple[torch.Tensor, dict[str, float]]:
-    """Restore only source highlight luminance that processing pushed downward.
-
-    The gate is derived from the original/reference Y channel. Midtones and
-    shadows are untouched, already-brightened pixels are never darkened, and
-    corrected chroma is retained. Gamut-safe recombination may reduce chroma
-    near RGB limits while preserving the requested recovered luminance.
-    """
-    if processed.shape != reference.shape or processed.ndim != 4 or processed.shape[1] != 3:
-        raise ValueError("processed and reference must be matching Bx3xHxW tensors")
-    strength = float(strength)
-    start = float(start)
-    full = float(full)
-    if strength <= 0.0:
-        return processed, {"gate_fraction": 0.0, "recovered_y_mean": 0.0, "gamut_compressed": 0.0}
-    if not (0.0 <= start < full <= 1.0):
-        raise ValueError("highlight recovery thresholds must satisfy 0 <= start < full <= 1")
-
-    proc_y, proc_c = rgb_to_y_cbcr(processed.float())
-    ref_y, _ = rgb_to_y_cbcr(reference.float())
-    t = ((ref_y - start) / max(1e-8, full - start)).clamp(0.0, 1.0)
-    gate = t * t * (3.0 - 2.0 * t)
-    lost = (ref_y - proc_y).clamp_min(0.0)
-    recovery = gate * lost * strength
-    recovered_y = proc_y + recovery
-    out, alpha = y_cbcr_to_rgb_preserve_y(recovered_y, proc_c)
-    with torch.no_grad():
-        stats = {
-            "gate_fraction": float((gate > 0.01).float().mean()),
-            "recovered_y_mean": float(recovery.mean()),
-            "gamut_compressed": float((alpha < 0.999).float().mean()),
-        }
-    return out, stats
+from tone_restore import match_tone_log_torch
 
 
 def discover(p: Path):
@@ -135,8 +96,8 @@ def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Hybrid Restormer with detail-preserving Y and optional residual-band cleanup.")
     p.add_argument("--input", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
-    p.add_argument("--luma-model", type=Path, required=True, help="Original/standard 3-channel Restormer final.pth")
-    p.add_argument("--chroma-model", type=Path, required=True, help="Fine-tuned 2-channel CbCr branch")
+    p.add_argument("--luma-model", type=Path, default=None, help="Original/standard 3-channel Restormer final.pth (required unless --no-restormer)")
+    p.add_argument("--chroma-model", type=Path, default=None, help="Fine-tuned 2-channel CbCr branch (required unless --no-restormer)")
     p.add_argument("--device", default="auto", help="PyTorch device: auto, cpu, mps, cuda, or an indexed CUDA device such as cuda:1")
     p.add_argument(
         "--amp", action=argparse.BooleanOptionalAction, default=True,
@@ -158,8 +119,16 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--orthogonal-profile-band-period", type=float, default=0.0,
                    help="Orthogonal-profile period override in perpendicular-axis pixels; 0 = auto")
 
+    p.add_argument(
+        "--restormer", action=argparse.BooleanOptionalAction, default=True,
+        help="Enable the neural Restormer Y/CbCr correction stage (use --no-restormer to run only deterministic cleanup stages)",
+    )
     p.add_argument("--passes", type=int, choices=(1, 2), default=1,
                    help="Use 2 only for unusually severe residual bands")
+    p.add_argument("--first-pass-luma-strength", type=float, default=1.0,
+                   help="Pass-1-only multiplier for the Restormer luminance correction")
+    p.add_argument("--first-pass-chroma-strength", type=float, default=1.0,
+                   help="Pass-1-only multiplier for the Restormer CbCr correction")
     p.add_argument("--second-pass-strength", type=float, default=1.0,
                    help="Scale both Y and chroma corrections on pass 2")
     p.add_argument("--exposure-lock", choices=("off", "pass2", "all"), default="pass2",
@@ -173,12 +142,17 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--no-row-anchor", action="store_true")
     p.add_argument("--luma-strength", type=float, default=1.0)
     p.add_argument("--chroma-strength", type=float, default=1.0)
-    p.add_argument("--highlight-recovery-strength", type=float, default=1.0,
-                   help="Restore a fraction of original near-white luminance lost during processing; 0 disables")
-    p.add_argument("--highlight-recovery-start", type=float, default=0.90,
-                   help="Original Y value where highlight recovery begins to fade in")
-    p.add_argument("--highlight-recovery-full", type=float, default=0.99,
-                   help="Original Y value where highlight recovery reaches full requested strength")
+    p.add_argument("--tone-restore", action=argparse.BooleanOptionalAction, default=True,
+                   help="Restore global contrast/gamma lost during processing")
+    p.add_argument("--tone-restore-strength", type=float, default=1.0,
+                   help="Restore global contrast/gamma lost during processing by matching the "
+                        "output tone curve to the source, fitted on band-axis-smoothed envelopes "
+                        "so the band residual is untouched; 0 disables")
+    p.add_argument("--tone-restore-max-gain", type=float, default=1.6,
+                   help="Largest luminance gain the tone restoration may apply at any level")
+    p.add_argument("--tone-restore-min-confidence", type=float, default=0.35,
+                   help="Skip tone restoration when band confidence is below this; protects "
+                        "images with non-stationary periods where band-axis smoothing is invalid")
 
     p.add_argument("--flat-filter", action="store_true",
                    help="Enable optional flat-region residual band post-filter")
@@ -262,6 +236,8 @@ def parser() -> argparse.ArgumentParser:
                    help="Horizontal regularization sigma for the final blended local correction; reduces edge halos around protected objects")
     p.add_argument("--flat-profile", action="store_true",
                    help="Enable optional residual 1-D row-profile suppression for faint globally coherent bands")
+    p.add_argument("--flat-profile-mode", choices=("smooth", "pwm"), default="smooth",
+                   help="Residual-profile waveform model: smooth periodic, or sharp two-state PWM/step")
     p.add_argument("--flat-profile-luma-strength", type=float, default=0.35,
                    help="Residual row-profile suppression strength for log-Y when --flat-profile is enabled")
     p.add_argument("--flat-profile-chroma-strength", type=float, default=0.35,
@@ -270,6 +246,14 @@ def parser() -> argparse.ArgumentParser:
                    help="Noise-suppression scale of residual profile as fraction of band period")
     p.add_argument("--flat-profile-base-ratio", type=float, default=0.40,
                    help="Baseline scale of residual profile as fraction of band period")
+    p.add_argument("--flat-profile-pwm-transition-ratio", type=float, default=0.010,
+                   help="PWM/step transition feather as fraction of the detected period")
+    p.add_argument("--flat-profile-pwm-min-duty", type=float, default=0.08,
+                   help="Minimum accepted PWM plateau duty fraction")
+    p.add_argument("--flat-profile-pwm-max-duty", type=float, default=0.92,
+                   help="Maximum accepted PWM plateau duty fraction")
+    p.add_argument("--flat-profile-pwm-min-transition-score", type=float, default=2.0,
+                   help="Minimum normalized repeated-transition score before PWM mode is accepted")
     p.add_argument("--flat-profile-band-period", type=float, default=0.0,
                    help="Override only the residual-profile period in full-resolution pixels; 0 = multiscale auto")
     p.add_argument("--flat-profile-period-mode", choices=("multiscale", "legacy"), default="multiscale",
@@ -298,13 +282,21 @@ def parser() -> argparse.ArgumentParser:
                    help="Maximum local multiplier of the globally estimated residual-profile waveform; 1.0 means attenuation-only")
     p.add_argument("--flat-profile-no-harm", action=argparse.BooleanOptionalAction, default=True,
                    help="Locally suppress residual-profile correction where it would increase band-limited residual energy")
+    p.add_argument("--flat-profile-pwm-polish", action=argparse.BooleanOptionalAction, default=False,
+                   help="Optional final PWM-only polish using only already-validated period/phase families")
+    p.add_argument("--flat-profile-pwm-polish-strength", type=float, default=1.0,
+                   help="Final PWM polish authority; 1.0 subtracts the measured remaining PWM component")
+    p.add_argument("--flat-profile-pwm-polish-passes", type=int, default=2,
+                   help="Maximum accepted PWM polish passes (1-3); each pass must reduce exact-mode energy")
 
     p.add_argument("--flat-surface-equalizer", action="store_true",
-                   help="Enable v1.7 dominant large-surface row equalizer for extremely broad/few-cycle residual bands")
+                   help="Enable broad/few-cycle residual cleanup")
+    p.add_argument("--flat-surface-equalizer-mode", choices=("dominant", "consensus"), default="consensus",
+                   help="Broad cleanup mode: one dominant surface, or multi-surface Y/CbCr consensus")
     p.add_argument("--flat-surface-equalizer-luma-strength", type=float, default=1.0,
-                   help="Large-surface equalizer strength for log-luminance")
+                   help="Broad log-luminance strength; consensus mode treats this as a maximum no-harm authority")
     p.add_argument("--flat-surface-equalizer-chroma-strength", type=float, default=1.0,
-                   help="Large-surface equalizer strength for CbCr")
+                   help="Broad CbCr strength; consensus mode treats this as a maximum vector no-harm authority")
     p.add_argument("--flat-surface-equalizer-degree", type=int, default=2,
                    help="Polynomial degree of the legitimate large-surface illumination/color baseline (default quadratic)")
     p.add_argument("--flat-surface-equalizer-preblur", type=float, default=4.0,
@@ -333,6 +325,18 @@ def parser() -> argparse.ArgumentParser:
                    help="Robust cross-column outlier scale for the large-surface row estimate")
     p.add_argument("--flat-surface-equalizer-min-coverage", type=float, default=0.04,
                    help="Minimum horizontal coverage of the selected surface required on a row")
+    p.add_argument("--flat-broad-consensus-regions", type=int, default=6,
+                   help="Number of large processing-X regions used by multi-surface broad consensus")
+    p.add_argument("--flat-broad-consensus-min-regions", type=int, default=2,
+                   help="Minimum mutually agreeing regions required by multi-surface broad consensus")
+    p.add_argument("--flat-broad-consensus-corr-low", type=float, default=0.55,
+                   help="Neural/residual anti-correlation where broad-consensus confidence begins")
+    p.add_argument("--flat-broad-consensus-corr-high", type=float, default=0.80,
+                   help="Neural/residual anti-correlation where broad-consensus confidence is full")
+    p.add_argument("--flat-broad-consensus-smooth-fraction", type=float, default=0.015,
+                   help="Broad-consensus row smoothing sigma as a fraction of processing height")
+    p.add_argument("--flat-broad-consensus-baseline-fraction", type=float, default=0.20,
+                   help="Legacy/fallback very-slow baseline sigma; neural-guided consensus uses affine region baselines")
 
     p.add_argument("--flat-allow-mean-shift", action="store_true",
                    help="Allow the local flat filter to change global Y/CbCr means")
@@ -376,16 +380,24 @@ def run_pass(
     if lock:
         field, removed_stops = remove_global_dc(field, small_y, domain=domain)
 
-    pass_scale = args.second_pass_strength if pass_index == 2 else 1.0
+    if pass_index == 1:
+        luma_scale = float(args.luma_strength) * float(args.first_pass_luma_strength)
+        chroma_scale = float(args.chroma_strength) * float(args.first_pass_chroma_strength)
+    else:
+        # Keep the historical pass-2 control independent of the new pass-1
+        # tuning sliders. Hidden legacy luma/chroma strengths remain global
+        # compatibility multipliers for CLI/settings files.
+        luma_scale = float(args.luma_strength) * float(args.second_pass_strength)
+        chroma_scale = float(args.chroma_strength) * float(args.second_pass_strength)
     current_y, current_c = rgb_to_y_cbcr(current.float())
     final_y = apply_correction_field(
         current_y,
         field,
         domain=domain,
         eps=args.luma_eps,
-        strength=args.luma_strength * pass_scale,
+        strength=luma_scale,
     )
-    dc = (chroma_pred.float() - small_c) * args.chroma_strength * pass_scale
+    dc = (chroma_pred.float() - small_c) * chroma_scale
     dc_full = resize(dc, (h, w))
     final, gamut_alpha = y_cbcr_to_rgb_preserve_y(final_y, current_c + dc_full)
     compressed = float((gamut_alpha < 0.999).float().mean())
@@ -460,7 +472,12 @@ def run_orthogonal_profile_cleanup(
         local_application_horizontal_sigma=args.flat_local_application_horizontal_sigma,
         residual_profile_luma_strength=(args.flat_profile_luma_strength if args.orthogonal_profile_luma_strength < 0 else args.orthogonal_profile_luma_strength),
         residual_profile_chroma_strength=(args.flat_profile_chroma_strength if args.orthogonal_profile_chroma_strength < 0 else args.orthogonal_profile_chroma_strength),
+        residual_profile_mode=args.flat_profile_mode,
         residual_profile_narrow_ratio=args.flat_profile_narrow_ratio,
+        residual_profile_pwm_transition_ratio=args.flat_profile_pwm_transition_ratio,
+        residual_profile_pwm_min_duty=args.flat_profile_pwm_min_duty,
+        residual_profile_pwm_max_duty=args.flat_profile_pwm_max_duty,
+        residual_profile_pwm_min_transition_score=args.flat_profile_pwm_min_transition_score,
         residual_profile_base_ratio=args.flat_profile_base_ratio,
         residual_profile_band_period_px=args.orthogonal_profile_band_period,
         period_mode=args.flat_profile_period_mode,
@@ -476,6 +493,9 @@ def run_orthogonal_profile_cleanup(
         residual_profile_adaptive_corr_high=args.flat_profile_adaptive_corr_high,
         residual_profile_adaptive_max_gain=args.flat_profile_adaptive_max_gain,
         residual_profile_no_harm=args.flat_profile_no_harm,
+        residual_profile_pwm_polish=args.flat_profile_pwm_polish,
+        residual_profile_pwm_polish_strength=args.flat_profile_pwm_polish_strength,
+        residual_profile_pwm_polish_passes=args.flat_profile_pwm_polish_passes,
         surface_equalizer_enabled=False,
         preserve_global_mean=True,
         debug_out=debug,
@@ -491,10 +511,16 @@ def main() -> int:
         raise ValueError("--processing-size must be a multiple of 8 in [256, 2048]")
     if not (0.0 <= args.second_pass_strength <= 2.0):
         raise ValueError("--second-pass-strength must be in [0, 2]")
-    if not (0.0 <= args.highlight_recovery_strength <= 1.0):
-        raise ValueError("--highlight-recovery-strength must be in [0, 1]")
-    if not (0.0 <= args.highlight_recovery_start < args.highlight_recovery_full <= 1.0):
-        raise ValueError("highlight recovery thresholds must satisfy 0 <= start < full <= 1")
+    if not (0.0 <= args.first_pass_luma_strength <= 2.0):
+        raise ValueError("--first-pass-luma-strength must be in [0, 2]")
+    if not (0.0 <= args.first_pass_chroma_strength <= 2.0):
+        raise ValueError("--first-pass-chroma-strength must be in [0, 2]")
+    if not (0.0 <= args.tone_restore_strength <= 1.0):
+        raise ValueError("--tone-restore-strength must be in [0, 1]")
+    if not (1.0 < args.tone_restore_max_gain <= 4.0):
+        raise ValueError("--tone-restore-max-gain must be in (1, 4]")
+    if not (0.0 <= args.tone_restore_min_confidence <= 1.0):
+        raise ValueError("--tone-restore-min-confidence must be in [0, 1]")
     if not (0.0 <= args.flat_cleanup_strength <= 3.0):
         raise ValueError("--flat-cleanup-strength must be in [0, 3]")
     if args.band_axis_auto_aspect_ratio <= 1.0:
@@ -509,27 +535,51 @@ def main() -> int:
         raise ValueError("--flat-local-correction-horizontal-sigma must be >= 0")
     if args.flat_local_application_horizontal_sigma < 0:
         raise ValueError("--flat-local-application-horizontal-sigma must be >= 0")
+    if args.flat_profile_pwm_transition_ratio <= 0:
+        raise ValueError("--flat-profile-pwm-transition-ratio must be > 0")
+    if not (0.0 < args.flat_profile_pwm_min_duty < args.flat_profile_pwm_max_duty < 1.0):
+        raise ValueError("PWM duty limits must satisfy 0 < min < max < 1")
+    if args.flat_profile_pwm_min_transition_score <= 0:
+        raise ValueError("--flat-profile-pwm-min-transition-score must be > 0")
     if args.flat_profile_adaptive_x_ratio <= 0 or args.flat_profile_adaptive_y_ratio <= 0:
         raise ValueError("--flat-profile-adaptive-x-ratio and --flat-profile-adaptive-y-ratio must be > 0")
     if not (0.0 <= args.flat_profile_adaptive_corr_low < args.flat_profile_adaptive_corr_high <= 1.0):
         raise ValueError("adaptive profile correlation thresholds must satisfy 0 <= low < high <= 1")
     if args.flat_profile_adaptive_max_gain <= 0:
         raise ValueError("--flat-profile-adaptive-max-gain must be > 0")
+    if not (0.0 <= args.flat_profile_pwm_polish_strength <= 1.25):
+        raise ValueError("--flat-profile-pwm-polish-strength must be in [0, 1.25]")
+    if not (1 <= args.flat_profile_pwm_polish_passes <= 6):
+        raise ValueError("--flat-profile-pwm-polish-passes must be in [1, 6]")
+    if args.flat_broad_consensus_regions < 2:
+        raise ValueError("--flat-broad-consensus-regions must be >= 2")
+    if not (2 <= args.flat_broad_consensus_min_regions <= args.flat_broad_consensus_regions):
+        raise ValueError("--flat-broad-consensus-min-regions must be between 2 and --flat-broad-consensus-regions")
+    if not (0.0 <= args.flat_broad_consensus_corr_low < args.flat_broad_consensus_corr_high <= 1.0):
+        raise ValueError("broad-consensus correlations must satisfy 0 <= low < high <= 1")
+    if args.flat_broad_consensus_smooth_fraction <= 0 or args.flat_broad_consensus_baseline_fraction <= args.flat_broad_consensus_smooth_fraction:
+        raise ValueError("broad-consensus fractions must satisfy 0 < smooth < baseline")
     device = choose_device(args.device)
     amp = bool(args.amp and device.type == "cuda")
 
-    luma = build_single_image_restormer()
-    strict_load(luma, load_state_dict_file(args.luma_model.expanduser().resolve()))
-    luma.to(device).eval()
-    chroma = build_chroma_branch()
-    strict_load(chroma, load_state_dict_file(args.chroma_model.expanduser().resolve()))
-    chroma.to(device).eval()
+    luma = None
+    chroma = None
+    if args.restormer:
+        if args.luma_model is None or args.chroma_model is None:
+            raise ValueError("--luma-model and --chroma-model are required when Restormer is enabled")
+        luma = build_single_image_restormer()
+        strict_load(luma, load_state_dict_file(args.luma_model.expanduser().resolve()))
+        luma.to(device).eval()
+        chroma = build_chroma_branch()
+        strict_load(chroma, load_state_dict_file(args.chroma_model.expanduser().resolve()))
+        chroma.to(device).eval()
 
-    print(f"device: {device}; AMP: {amp}; passes={args.passes}; exposure-lock={args.exposure_lock}; band-axis={args.band_axis}")
+    print(f"device: {device}; AMP: {amp}; restormer={args.restormer}; passes={args.passes}; exposure-lock={args.exposure_lock}; band-axis={args.band_axis}")
     print(
         f"luma-mode={args.luma_mode}; sigma-x={args.horizontal_sigma:g}; "
         f"row-anchor={not args.no_row_anchor}; flat-filter={args.flat_filter}; "
-        f"flat-profile={args.flat_profile}; surface-equalizer={args.flat_surface_equalizer}"
+        f"flat-profile={args.flat_profile} mode={args.flat_profile_mode}; surface-equalizer={args.flat_surface_equalizer}"
+        f"({args.flat_surface_equalizer_mode})"
     )
     images = discover(root)
     if not images:
@@ -561,22 +611,25 @@ def main() -> int:
 
         infos = []
         domain = "log"
-        for pass_index in range(1, args.passes + 1):
-            current, info, domain = run_pass(
-                current,
-                luma=luma,
-                chroma=chroma,
-                device=device,
-                amp=amp,
-                args=args,
-                pass_index=pass_index,
-            )
-            infos.append(info)
-            print(
-                f"  pass {pass_index}: corr-rms={info.constrained_rms:.5f} "
-                f"exposure-removed={info.exposure_removed_stops:+.4f} stops "
-                f"gamut-compressed={100*info.gamut_compressed:.2f}%"
-            )
+        if args.restormer:
+            for pass_index in range(1, args.passes + 1):
+                current, info, domain = run_pass(
+                    current,
+                    luma=luma,
+                    chroma=chroma,
+                    device=device,
+                    amp=amp,
+                    args=args,
+                    pass_index=pass_index,
+                )
+                infos.append(info)
+                print(
+                    f"  pass {pass_index}: corr-rms={info.constrained_rms:.5f} "
+                    f"exposure-removed={info.exposure_removed_stops:+.4f} stops "
+                    f"gamut-compressed={100*info.gamut_compressed:.2f}%"
+                )
+        else:
+            print("  Restormer disabled; using source image as deterministic-cleanup input")
 
         flat_stats = None
         flat_mask = None
@@ -584,12 +637,35 @@ def main() -> int:
         cleanup_enabled = bool(args.flat_filter or args.flat_profile or args.flat_surface_equalizer)
         if cleanup_enabled:
             final_y, final_c = rgb_to_y_cbcr(current.float())
-            last = infos[-1]
+            broad_neural_gain_hint = None
+            broad_neural_chroma_hint = None
+            cleanup_luma_hint = infos[-1].field if infos else None
+            cleanup_chroma_hint = infos[-1].chroma_delta if infos else None
+            needs_cumulative_hint = bool(
+                (args.flat_profile and args.flat_profile_mode == "pwm")
+                or (args.flat_surface_equalizer and args.flat_surface_equalizer_mode == "consensus")
+            )
+            if needs_cumulative_hint and args.restormer:
+                source_y_for_cleanup, source_c_for_cleanup = rgb_to_y_cbcr(source_oriented.float())
+                cumulative_luma_hint = torch.log(
+                    (final_y.float().clamp_min(0.0) + float(args.luma_eps))
+                    / (source_y_for_cleanup.float().clamp_min(0.0) + float(args.luma_eps))
+                )
+                cumulative_chroma_hint = final_c.float() - source_c_for_cleanup.float()
+                # PWM timing must use the cumulative source -> post-neural
+                # correction. With two passes, infos[-1] contains only pass 2,
+                # which can be too weak to expose the repeated transition train.
+                if args.flat_profile and args.flat_profile_mode == "pwm":
+                    cleanup_luma_hint = cumulative_luma_hint
+                    cleanup_chroma_hint = cumulative_chroma_hint
+                if args.flat_surface_equalizer and args.flat_surface_equalizer_mode == "consensus":
+                    broad_neural_gain_hint = cumulative_luma_hint
+                    broad_neural_chroma_hint = cumulative_chroma_hint
             final_y, final_c, flat_mask, flat_stats = apply_flat_region_filter(
                 final_y,
                 final_c,
-                luma_field=last.field,
-                chroma_delta_hint=last.chroma_delta,
+                luma_field=cleanup_luma_hint,
+                chroma_delta_hint=cleanup_chroma_hint,
                 band_period_px=(args.flat_band_period if args.flat_filter else 0.0),
                 period_sigma_ratio=args.flat_period_sigma_ratio,
                 coherence_sigma_x=args.flat_horizontal_sigma,
@@ -640,7 +716,12 @@ def main() -> int:
                 local_application_horizontal_sigma=args.flat_local_application_horizontal_sigma,
                 residual_profile_luma_strength=(args.flat_profile_luma_strength if args.flat_profile else 0.0),
                 residual_profile_chroma_strength=(args.flat_profile_chroma_strength if args.flat_profile else 0.0),
+                residual_profile_mode=args.flat_profile_mode,
                 residual_profile_narrow_ratio=args.flat_profile_narrow_ratio,
+                residual_profile_pwm_transition_ratio=args.flat_profile_pwm_transition_ratio,
+                residual_profile_pwm_min_duty=args.flat_profile_pwm_min_duty,
+                residual_profile_pwm_max_duty=args.flat_profile_pwm_max_duty,
+                residual_profile_pwm_min_transition_score=args.flat_profile_pwm_min_transition_score,
                 residual_profile_base_ratio=args.flat_profile_base_ratio,
                 residual_profile_band_period_px=args.flat_profile_band_period,
                 period_mode=args.flat_profile_period_mode,
@@ -656,7 +737,11 @@ def main() -> int:
                 residual_profile_adaptive_corr_high=args.flat_profile_adaptive_corr_high,
                 residual_profile_adaptive_max_gain=args.flat_profile_adaptive_max_gain,
                 residual_profile_no_harm=args.flat_profile_no_harm,
+                residual_profile_pwm_polish=args.flat_profile_pwm_polish,
+                residual_profile_pwm_polish_strength=args.flat_profile_pwm_polish_strength,
+                residual_profile_pwm_polish_passes=args.flat_profile_pwm_polish_passes,
                 surface_equalizer_enabled=args.flat_surface_equalizer,
+                surface_equalizer_mode=args.flat_surface_equalizer_mode,
                 surface_equalizer_luma_strength=args.flat_surface_equalizer_luma_strength,
                 surface_equalizer_chroma_strength=args.flat_surface_equalizer_chroma_strength,
                 surface_equalizer_poly_degree=args.flat_surface_equalizer_degree,
@@ -673,6 +758,14 @@ def main() -> int:
                 surface_equalizer_row_sigma=args.flat_surface_equalizer_row_sigma,
                 surface_equalizer_huber_k=args.flat_surface_equalizer_huber_k,
                 surface_equalizer_min_coverage=args.flat_surface_equalizer_min_coverage,
+                broad_consensus_regions=args.flat_broad_consensus_regions,
+                broad_consensus_min_regions=args.flat_broad_consensus_min_regions,
+                broad_consensus_corr_low=args.flat_broad_consensus_corr_low,
+                broad_consensus_corr_high=args.flat_broad_consensus_corr_high,
+                broad_consensus_smooth_fraction=args.flat_broad_consensus_smooth_fraction,
+                broad_consensus_baseline_fraction=args.flat_broad_consensus_baseline_fraction,
+                broad_neural_gain_hint=broad_neural_gain_hint,
+                broad_neural_chroma_hint=broad_neural_chroma_hint,
                 preserve_global_mean=not args.flat_allow_mean_shift,
                 debug_out=flat_debug,
             )
@@ -681,7 +774,8 @@ def main() -> int:
             lo_txt = "off" if flat_stats.luma_min_lstar is None else f"{flat_stats.luma_min_lstar:.2f}"
             hi_txt = "off" if flat_stats.luma_max_lstar is None else f"{flat_stats.luma_max_lstar:.2f}"
             print(
-                f"  cleanup: local={args.flat_filter} profile={args.flat_profile} surface-eq={args.flat_surface_equalizer}; "
+                f"  cleanup: local={args.flat_filter} profile={args.flat_profile} ({args.flat_profile_mode}) "
+                f"surface-eq={args.flat_surface_equalizer} mode={args.flat_surface_equalizer_mode}; "
                 f"blend>0.5={100*flat_stats.flat_fraction:.1f}% "
                 f"support>0.5={100*flat_stats.support_fraction:.1f}% coarse>0.5={100*flat_stats.coarse_fraction:.1f}% "
                 f"tone>0.5={100*flat_stats.luma_gate_fraction:.1f}% Lab-L*={lo_txt}..{hi_txt} "
@@ -696,6 +790,13 @@ def main() -> int:
                 f"eqY={flat_stats.surface_equalizer_y_rms:.5f} eqC={flat_stats.surface_equalizer_c_rms:.5f} "
                 f"gamut-compressed={100*compressed:.2f}%"
             )
+            if args.flat_surface_equalizer and args.flat_surface_equalizer_mode == "consensus":
+                print(
+                    f"    broad consensus: confidence={flat_stats.broad_consensus_confidence:.2f} "
+                    f"agreeing-regions={flat_stats.broad_consensus_regions} "
+                    f"Y={flat_stats.surface_equalizer_y_rms:.5f} "
+                    f"C={flat_stats.surface_equalizer_c_rms:.5f}"
+                )
             if args.flat_profile and flat_stats.band_candidates:
                 cand = ", ".join(f"{p:.0f}px:{score:.2f}" for p, score in flat_stats.band_candidates)
                 print(f"    profile period candidates: {cand}")
@@ -712,19 +813,45 @@ def main() -> int:
                 f"Y={orth_stats.profile_y_rms:.5f} C={orth_stats.profile_c_rms:.5f}"
             )
 
-        current, highlight_stats = apply_highlight_recovery(
-            current, source_oriented,
-            strength=args.highlight_recovery_strength,
-            start=args.highlight_recovery_start,
-            full=args.highlight_recovery_full,
-        )
-        if args.highlight_recovery_strength > 0:
-            print(
-                f"  highlight-recovery: strength={args.highlight_recovery_strength:.2f} "
-                f"gate={100*highlight_stats['gate_fraction']:.2f}% "
-                f"mean-Y-restored={highlight_stats['recovered_y_mean']:.5f} "
-                f"gamut-compressed={100*highlight_stats['gamut_compressed']:.2f}%"
-            )
+
+        # P11: restore global contrast/gamma. Applied as a smooth additive
+        # offset in log space, fitted on band-axis-smoothed envelopes, so the
+        # band residual passes through unchanged. Skipped when the period is
+        # absent or unreliable -- band-axis smoothing is meaningless then.
+        if args.tone_restore and args.tone_restore_strength > 0:
+            _tone_conf = 0.0 if flat_stats is None else float(flat_stats.band_confidence)
+            # P11b: pick a period we actually trust, else fall back, else 0.0.
+            # band_confidence is 0.00 whenever --flat-profile is off, which is
+            # an ABSENT measurement rather than a bad one -- the old gate
+            # rejected those images outright even though period=0 simply
+            # disables band smoothing and is perfectly safe.
+            _tone_period = 0.0
+            if flat_stats is not None:
+                if _tone_conf >= args.tone_restore_min_confidence:
+                    _tone_period = float(flat_stats.profile_period_px)
+                elif float(flat_stats.band_period_px) > 3.0:
+                    # Local flat stage's period: a measurement, not a
+                    # placeholder. test1_input reports 95.3px against a true
+                    # 96.3; test3_input_crop 39.0 against 38.9.
+                    _tone_period = float(flat_stats.band_period_px)
+            if True:
+                _proc_y, _proc_c = rgb_to_y_cbcr(current.float())
+                _ref_y, _ = rgb_to_y_cbcr(source_oriented.float())
+                _new_y, _tone_stats = match_tone_log_torch(
+                    _proc_y, _ref_y,
+                    period=_tone_period,
+                    strength=args.tone_restore_strength,
+                    max_gain=args.tone_restore_max_gain,
+                )
+                current, _tone_alpha = y_cbcr_to_rgb_preserve_y(_new_y, _proc_c)
+                print(
+                    f"  tone-restore: strength={args.tone_restore_strength:.2f} "
+                    f"period={_tone_period:.1f}px conf={_tone_conf:.2f} "
+                    f"{'(no band smoothing)' if _tone_period <= 3.0 else ''} "
+                    f"contrast={_tone_stats['contrast_ratio']:.3f} "
+                    f"delta-max={_tone_stats['delta_max']:.4f} "
+                    f"gamut-compressed={100*float((_tone_alpha < 0.999).float().mean()):.2f}%"
+                )
 
         display_current = restore_display_orientation(current, axis_decision.axis)
         save_rgb(display_current.squeeze(0), dst)
@@ -736,7 +863,7 @@ def main() -> int:
                 save_field_map(dbg_field, dbg / f"{stem}_pass{i}_luma_correction.png", domain)
             if flat_mask is not None:
                 save_gray(restore_display_orientation(flat_mask[0], axis_decision.axis), dbg / f"{stem}_flat_blend_mask.png")
-            for name in ("fine_mask", "coarse_mask", "local_extent_gate", "local_color_gate", "local_fill_gate", "local_edge_distance_gate", "local_surface_gate", "local_safe_gate", "local_structure_gate", "support_mask", "profile_support_mask", "profile_application_gate", "profile_confidence", "profile_apply_mask", "profile_adaptive_gain_y", "profile_adaptive_gain_c", "profile_adaptive_evidence_y", "profile_adaptive_evidence_c", "period_support", "edge_support", "broad_structure_support", "luma_gate", "raw_tone_support", "raw_tone_veto", "base_lstar", "surface_equalizer_candidate", "surface_equalizer_region", "surface_equalizer_apply"):
+            for name in ("fine_mask", "coarse_mask", "local_extent_gate", "local_color_gate", "local_fill_gate", "local_edge_distance_gate", "local_surface_gate", "local_safe_gate", "local_structure_gate", "support_mask", "profile_support_mask", "profile_application_gate", "profile_confidence", "profile_apply_mask", "profile_adaptive_gain_y", "profile_adaptive_gain_c", "profile_adaptive_evidence_y", "profile_adaptive_evidence_c", "period_support", "edge_support", "broad_structure_support", "luma_gate", "raw_tone_support", "raw_tone_veto", "base_lstar", "surface_equalizer_candidate", "surface_equalizer_region", "surface_equalizer_apply", "broad_consensus_evidence", "broad_consensus_chroma_evidence", "broad_consensus_confidence"):
                 if name in flat_debug:
                     save_gray(restore_display_orientation(flat_debug[name][0], axis_decision.axis), dbg / f"{stem}_flat_{name}.png")
             if orth_debug:
@@ -763,6 +890,9 @@ def main() -> int:
                     f"surface_equalizer_fraction={flat_stats.surface_equalizer_fraction:.6f}",
                     f"surface_equalizer_y_rms={flat_stats.surface_equalizer_y_rms:.6f}",
                     f"surface_equalizer_c_rms={flat_stats.surface_equalizer_c_rms:.6f}",
+                    f"surface_equalizer_mode={args.flat_surface_equalizer_mode}",
+                    f"broad_consensus_confidence={flat_stats.broad_consensus_confidence:.6f}",
+                    f"broad_consensus_regions={flat_stats.broad_consensus_regions}",
                     "candidates=" + ", ".join(f"{p:.3f}px:{score:.6f}" for p, score in flat_stats.band_candidates),
                 ]
                 (dbg / f"{stem}_band_analysis.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")

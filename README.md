@@ -1,6 +1,6 @@
 # **Flicker Suppressor** 🎨
 
-Single-image/batch restoration for rolling-shutter flicker/banding under temporally modulated artificial lighting. This tool combines a Restormer-based luminance correction estimator, a dedicated two-channel chroma branch, orientation-aware processing, deterministic cleanup for difficult residual bands, and optional per-stage GUI paint masks.
+Single-image/batch restoration for rolling-shutter flicker/banding under temporally modulated artificial lighting. This tool combines a Restormer-based luminance correction estimator, a dedicated two-channel chroma branch, orientation-aware processing, deterministic cleanup for difficult residual bands, and per-stage GUI paint masks.
 
 Flicker Suppressor runs locally. Images are not uploaded anywhere by the program.
 
@@ -118,6 +118,51 @@ python .\hybrid_infer_detail_preserving.py `
 
 `--band-axis auto` is the default. Output is written as PNG.
 
+### Deterministic cleanup without Restormer
+
+If the neural correction is unhelpful for a particular image (like one with PWM lights), disable it completely. The model files are not loaded or required in this mode:
+
+```powershell
+python .\hybrid_infer_detail_preserving.py `
+    --input .\photo.jpg `
+    --output .\photo_restored.png `
+    --no-restormer `
+    --flat-profile `
+    --flat-profile-mode pwm
+```
+
+The GUI exposes the same choice as **Enable Restormer correction**. For new images and after a GUI settings reset, this checkbox is **off by default**; the CLI keeps Restormer enabled by default for backward compatibility. When the GUI checkbox is off, Restormer-only controls are greyed out; **Band direction** remains editable because the deterministic cleanup stages still use the same orientation.
+
+The first pass also has separate **First-pass luminance strength** and **First-pass chroma strength** controls (`--first-pass-luma-strength` and `--first-pass-chroma-strength`, both default `1.0`) when Restormer is enabled.
+
+## Essential editing settings (beta)
+
+When an image is imported, Flicker Suppressor can analyse it and fill in the settings that have to be right before any other tuning matters:
+
+- **Band direction** — which way the bands run;
+- **Band period** — the fundamental spacing of the bands;
+- whether the **Residual profile** stage should run, and in which mode.
+
+Everything else stays at its defaults. Toggle the feature from **Edit → Essential editing settings**; it is on by default and the choice is remembered.
+
+**This is a beta feature and its scope is deliberately narrow.** It determines four settings out of roughly 120. It does not choose strengths, pass counts, or safety thresholds — those still depend on the image and your judgement. Finding the essential settings is not the same as restoring the image: it points the correction at the right frequency on the right axis, and the rest of the work is still yours.
+
+The analysis measures the band on log-channel ratios rather than luminance alone. Scene structure is multiplicative and largely cancels in a ratio, while a flicker source with a different spectrum from the ambient light does not — so the band stands out much more clearly, and periods that luminance reports as a harmonic are often resolved correctly. Every candidate is then cross-checked across several search windows and several ratios; a period that changes when the search window changes is treated as undetermined rather than reported as a result.
+
+The agreement rule is deliberately strict. It will decline on some images it could have handled rather than risk a confident wrong answer. When it declines, that image is reset to defaults and a notice appears the first time you select it. Greyscale images are capped at medium confidence, because with no colour ratios there is no second opinion to check luminance against.
+
+**Band period** is a dropdown offering **Auto**, each detected candidate, and **Custom…**. Candidates show their cycle count and are marked as harmonics or independent alternatives — mistaking a second harmonic for the fundamental is the most common way period detection goes wrong, so the alternatives are one click away. **Custom…** enables the numeric field.
+
+While the analysis runs the window is covered by a progress overlay, but dragging more images onto the canvas or the filmstrip still works, so a further import can be queued.
+
+The same analysis is available from the command line and writes a JSON recipe:
+
+```powershell
+python .\autosettings.py --input .\photo.jpg --json .\photo.settings.json
+```
+
+Add `--base defaults.json` to merge the estimate into a complete recipe rather than emitting only the estimated keys. The exit code is `2` when confidence is too low to use.
+
 ### Strong/severe bands
 
 Use a second pass when one pass leaves obvious residual bands:
@@ -153,13 +198,57 @@ For exceptionally strong fine periodic bands, values around `0.8-1.2` can be use
 
 Residual-profile correction is spatially adaptive by default: Flicker Suppressor still estimates one robust global band period/phase/waveform, then fits only a slowly varying local amplitude from the band-limited residual that matches that waveform. The current default is attenuation-only (`max gain = 1.0`), which lets weakly supported regions receive less correction without silently exceeding the user's selected profile strength. The no-harm validator is band-coherent: it may vary only along the band direction, so it can reject a harmful scene zone without drawing 2-D object silhouettes into the profile correction.
 
-### Very broad residuals on one dominant surface
+For strobed/PWM LED lighting whose residual bands have square-ish plateaus and sharper transitions, Residual Profile also offers **PWM / Step** mode. Auto timing is **fundamental-first**: the residual image is converted into a scene-resistant row/column transition signal, autocorrelation peaks are compared as a family, and near-tied large multiples are rejected in favor of the shortest recurrent candidate that still has enough visible cycles and two opposite repeated PWM transitions. This avoids assigning a large harmonic or an autocorrelation plateau in place of the real period. The detected period is then refined against phase drift across the frame, which matters most on images with many visible cycles, where an error under one percent is enough to lose most of the correction. A manual Profile period remains exact and bypasses Auto selection.
+
+When Restormer is enabled, its cumulative source-to-post-neural correction is available as an additional timing/validation cue only; its magnitude is never blindly reapplied. When Restormer is disabled or contributes little useful PWM evidence, PWM / Step can lock directly from the visible residual image. A strongly coherent single source uses a **global phase lock with local radiometric amplitude fitting**. More ambiguous scenes can use the multi-period/multi-surface path, which groups harmonic-related candidates, jointly fits independent validated period families, and lets coherent surfaces carry different local source amplitudes without giving every region an unconstrained phase.
+
+An optional **Final PWM polish** runs after the normal profile/local cleanup. It does not search for any new frequency: it reuses only already-validated PWM period families, measures the remaining exact-mode energy, and accepts extra passes only when the known PWM component decreases without an excessive increase in nearby control frequencies. The stage stops when the remaining residual is no longer phase-coherent with the band, so the maximum pass count is an upper bound rather than a value that needs tuning per image. The GUI exposes the polish only for **PWM / Step**; its checkbox/strength/pass controls are greyed out in **Smooth periodic** mode. In PWM mode use **Enable final PWM polish**; CLI equivalent:
+
+```powershell
+--flat-profile `
+--flat-profile-mode pwm `
+--flat-profile-pwm-polish `
+--flat-profile-pwm-polish-strength 1.0 `
+--flat-profile-pwm-polish-passes 2
+```
+
+### Tone restoration
+
+The neural passes compress the tonal range: shadows lift and highlights compress. This is a global change rather than a band, so none of the band-focused cleanup stages can see or repair it. **Tone restoration** runs at the end of the pipeline and puts the contrast and gamma back.
+
+It is on by default. The GUI exposes it under **Tone restoration** as a checkbox and **Restoration strength** (default `1.00`); `1.00` matches the original image's tone most closely, and lower values apply a proportionally smaller correction. CLI equivalents:
+
+```powershell
+--tone-restore `
+--tone-restore-strength 1.0
+```
+
+Use `--no-tone-restore` to disable the stage.
+
+The correction is fitted on band-axis-smoothed envelopes and applied as a smooth offset in log space, so the periodic residual passes through unchanged — a tone curve applied directly to a still-banded image would re-expand the very bands the earlier stages removed. Positive corrections are also limited by remaining highlight headroom, so restoring contrast cannot drive near-white detail into clipping.
+
+Two further options exist on the command line but are not shown in the desktop panel, because neither is useful for ordinary images: `--tone-restore-max-gain` is a safety clamp that normal photographs do not approach, and `--tone-restore-min-confidence` selects which period the stage smooths with rather than whether it runs.
+
+### Very broad residuals
 
 ```powershell
 --flat-surface-equalizer
 ```
 
-This is an advanced, stronger option for large walls or other dominant surfaces where only a few very broad band cycles remain. See `DOCUMENTATION.md` before enabling it routinely.
+Broad residual cleanup has two modes. The default is now `consensus` (**Multi-surface consensus**), intended for cases where the same very broad luminance and/or chroma residual appears across multiple unrelated surfaces. `dominant` remains available for the older one-large-surface equalizer. With Restormer enabled, the consensus path can use cumulative Restormer Y and Cb/Cr changes only as validation evidence, then measures the remaining broad waveforms independently across several scene regions. With Restormer disabled, luminance consensus still has an image-only cross-region fallback; consensus chroma is conservatively withheld without a neural chroma direction hint. When neural hints are available, guided luminance specifically looks for an under-corrected residual opposite to the neural gain, while chroma accepts a strong vector relationship in either sign so it can also remove an overshot/model-introduced color cast. This lets it recover sub-cycle / single-trough residuals that are too broad for the normal periodic profile:
+
+```powershell
+--flat-surface-equalizer `
+--flat-surface-equalizer-mode consensus
+```
+
+The desktop GUI exposes the same choice as **Broad mode** under **Broad residual cleanup**, together with **Broad luminance strength** and **Broad chroma strength** (both default 1.00, range 0-2). In consensus mode each strength is a maximum authority: the no-harm fit may use less correction when the evidence does not support the full requested value. After a luminance consensus has already been validated, one automatic low-authority refinement pass can re-measure a small remaining copy of the same broad waveform; it has no separate GUI control and is capped to 35% extra authority with its own same-waveform/no-harm validation. Both modes use the existing Broad paint mask as a final application gate. See `DOCUMENTATION.md` before enabling broad cleanup routinely.
+
+## Developer settings JSON
+
+The desktop **Export/import settings (dev)** section provides two stacked buttons: **Export json** followed by **Import json**. Export writes the current image's complete processing recipe, including GUI-hidden parser defaults, while excluding machine-specific paths and painted mask pixels.
+
+Import accepts Flicker Suppressor processing-settings JSON only. The file is parsed and validated before any setting is changed: unknown keys, wrong JSON types, invalid enum choices, non-finite numbers, out-of-range GUI values, malformed RGB cutoff colors, and an invalid Shadow/Highlight ordering are rejected with an error. Older or partial exports are supported when they contain only known settings; missing fields are filled from the current defaults. Import applies to the current activated image, marks its preview stale so the next Preview/Export recomputes it, and preserves any authored cleanup masks because masks are not part of the developer JSON.
 
 ## Batch processing
 
@@ -186,12 +275,20 @@ The source directory structure is preserved and all outputs are written as PNG. 
 | Situation | Suggested options |
 |---|---|
 | Normal case | defaults; CUDA AMP is on automatically (`--no-amp` forces FP32) |
+| Neural pass changes luminance/chroma too much | tune `--first-pass-luma-strength` and `--first-pass-chroma-strength` separately |
+| Unsure which band direction/period an image needs | let **Essential editing settings** analyse it on import, or run `autosettings.py` from the CLI |
+| Restormer is useless for the PWM pattern | `--no-restormer --flat-profile --flat-profile-mode pwm` |
 | Severe bands | `--passes 2 --flat-filter` |
-| Faint residual bands / textured wall | `--flat-profile --flat-profile-luma-strength 0.50 --flat-profile-chroma-strength 0.50` (add `--flat-filter` only when local flat-surface cleanup is also useful) |
+| Faint residual bands / textured wall | `--flat-profile --flat-profile-luma-strength 0.50 --flat-profile-chroma-strength 0.50` |
 | Very fine strong periodic bands | previous preset + raise profile strengths; optionally force `--flat-profile-band-period` |
+| Sharp square/PWM LED stripes | `--flat-profile --flat-profile-mode pwm`; leave period on Auto first |
+| Correct PWM period but faint bands remain | add `--flat-profile-pwm-polish --flat-profile-pwm-polish-strength 1.0 --flat-profile-pwm-polish-passes 4` |
+| Result looks flatter/duller than the original | tone restoration is on by default; raise `--tone-restore-strength` toward `1.0`, or lower it if midtones look over-lifted |
+| Auto period chooses incorrectly in an unusual frame | measure/force `--flat-profile-band-period`; manual periods are exact |
 | Visible vertical bands | `--band-axis vertical` or Auto |
 | Mixed horizontal + vertical residuals | add `--orthogonal-profile`; it is independent of the main `--flat-profile` switch |
-| Very broad few-cycle residual on dominant surface | `--flat-surface-equalizer` can be enabled independently; combine with other cleanup stages only when needed |
+| Very broad residual shared across the frame | `--flat-surface-equalizer` (default Broad mode: Multi-surface consensus) |
+| Very broad few-cycle residual confined to one dominant surface | `--flat-surface-equalizer --flat-surface-equalizer-mode dominant` |
 | Localized cleanup in the GUI | paint the corresponding Flat / Residual / Broad **Mask**; the mask gates only that stage's visible correction |
 | Debugging masks/period detection | add `--debug-dir .\debug` |
 
@@ -215,8 +312,11 @@ See [`DOCUMENTATION.md`](DOCUMENTATION.md) for:
 - Auto orientation uses a physical aspect-ratio prior for ordinary portrait/landscape images. Manually rotated/cropped files can require `--band-axis horizontal` or `vertical`.
 - Aggressive local flattening can alter legitimate smooth surfaces if safety thresholds are relaxed too far.
 - Aggressive profile strengths can overcorrect real row/column illumination variation; the high-strength guards reduce common failures but cannot prove that every scene variation is flicker.
-- Painted GUI cleanup masks are session/per-image editing data; they are used for preview/export but are not serialized into the developer settings JSON.
+- Multiple PWM sources with different periods/phases can be decomposed only when the single image contains enough independent evidence. Exact harmonic relationships, very few visible cycles, clipping, or scene structure aligned with the same period/phase can remain ambiguous.
+- Painted GUI cleanup masks are session/per-image editing data; they are used for preview/export but are not serialized into, or replaced by, developer settings JSON import/export.
 - Current GUI and CLI exports are 8-bit RGB PNG; original RAW/high-bit-depth image metadata is not preserved.
+- **Essential editing settings is beta.** It determines band direction, band period and the residual cleanup mode only; strengths, pass counts and safety thresholds are not estimated, and a successful analysis does not mean the image is restored. It declines rather than guessing when the evidence is ambiguous, and it will sometimes decline on images it could have handled.
+- Settings JSON files written before this version contain highlight-recovery keys and will be rejected on import. Remove `highlight_recovery_strength`, `highlight_recovery_start` and `highlight_recovery_full`, or re-export the recipe.
 
 ## License and third-party software
 
@@ -259,4 +359,4 @@ Restormer:
 
 ---
 
-*Last Updated: 17 August 2026*
+*Last Updated: 24 August 2026*

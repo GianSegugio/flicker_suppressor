@@ -18,65 +18,11 @@ The system is intentionally modular. A difficult case can receive stronger resid
 
 ## 2. High-level architecture
 
-```text
-                         INPUT RGB
-                             |
-                             v
-                 EXIF orientation normalization
-                             |
-                             v
-                  band-axis decision/override
-                             |
-             +---------------+---------------+
-             |                               |
-       horizontal bands                vertical bands
-       process directly            rotate 90 degrees
-             |                               |
-             +---------------+---------------+
-                             |
-                             v
-                    processing RGB image
-                             |
-                 resize to 512 x 512 by default
-                             |
-              +--------------+---------------+
-              |                              |
-              v                              v
-       RGB Restormer Y branch        2-channel CbCr branch
-              |                              |
-       candidate restored Y          candidate restored Cb/Cr
-              |                              |
-       derive correction field       derive Delta Cb / Delta Cr
-              |                              |
-       directional constraint                |
-              |                              |
-              +--------------+---------------+
-                             |
-                 apply corrections to ORIGINAL
-                 full-resolution Y/Cb/Cr data
-                             |
-                 gamut-safe YCbCr -> RGB
-                             |
-                     optional second pass
-                             |
-                      optional cleanup
-        +--------------------+---------------------+
-        |                    |                     |
-  local flat filter    robust row profile   large-surface equalizer
-        |                    |                     |
-        +--------------------+---------------------+
-                             |
-                optional orthogonal profile
-                 (`--orthogonal-profile`)
-                             |
-                selective highlight recovery
-                             |
-                    restore orientation
-                             |
-                          PNG output
-```
+![Flicker Suppressor processing pipeline: High-level architecture.](img/docs/high-level_architecture.png)
 
 The neural networks operate at the configurable processing resolution. Their output is primarily treated as an **estimate of correction**, which is then resized and applied to the original-resolution image. This is a key design choice for preserving detail.
+
+The Restormer stage is optional. With `--no-restormer`, the model files are not loaded and no neural inference runs; the oriented source image is passed directly to the deterministic cleanup stages. This is useful for PWM cases where the neural model contributes little useful band correction or alters unrelated image content. Residual PWM timing can be estimated from the image itself, while neural correction fields are used only as optional timing/validation evidence when they exist.
 
 In the desktop GUI, Flat-region cleanup, Residual profile, and Broad residual cleanup can each have an optional painted mask. These masks are **final application gates**, not alternate estimators: the automatic stage can still analyze the complete image, but its visible delta is multiplied by the user mask before it reaches the output. This keeps period/surface estimation stable while guaranteeing that authored masks restrict where the corresponding cleanup is shown.
 
@@ -183,30 +129,62 @@ With the default row anchor, horizontal filtering preserves the mean correction 
 
 ---
 
-## 6. Recursive two-pass processing and exposure lock
+## 6. Optional Restormer stage, pass strengths, and exposure lock
 
-`--passes 2` feeds the first restored result through the neural pipeline a second time. This is useful for unusually severe residual bands.
+The CLI parser enables the neural stage by default for backward compatibility and it can be disabled with:
 
-A naive second pass tends to accumulate a positive global luminance shift. The default `--exposure-lock pass2` removes the global DC component from the second Y correction before it is applied. The local row/band correction remains.
+```powershell
+--no-restormer
+```
 
-You can reduce pass-two aggressiveness with, for example:
+When disabled, neither `models/y.pth` nor `models/chroma.pth` is loaded, `--passes` is not executed, and deterministic cleanup starts from the oriented source image. In the GUI, **Enable Restormer correction** provides the same switch and is **off by default for new images and after a settings reset**. Restormer-only controls are greyed out while it is disabled. **Band direction** intentionally remains enabled because residual/profile/broad cleanup still needs the same orientation. The CLI default remains on.
+
+When Restormer is enabled, The first pass now has independent visible authority controls:
+
+```powershell
+--first-pass-luma-strength 1.0 `
+--first-pass-chroma-strength 1.0
+```
+
+Both are constrained to `0-2`. The legacy global `--luma-strength` and `--chroma-strength` remain compatibility multipliers; on pass 1 the effective authority is the global value multiplied by the corresponding new first-pass slider. This lets a case keep useful neural chroma correction while reducing neural luminance, or vice versa.
+
+`--passes 2` feeds the first restored result through the neural pipeline a second time. The pass-1 sliders do **not** change pass 2. Pass 2 keeps the historical shared control:
 
 ```powershell
 --passes 2 `
 --second-pass-strength 0.70
 ```
 
-The normal CLI default remains one pass.
+A naive second pass can accumulate a global luminance shift. The CLI default `--exposure-lock pass2` removes the global DC component from the second Y correction before it is applied. The desktop GUI hides Exposure lock and forces `exposure_lock = all`, applying the DC lock to either neural pass.
 
-The desktop GUI deliberately hides Exposure lock and forces `exposure_lock = all` in its complete inference namespace. This applies the global-DC lock to both passes and also prevents older/pasted GUI settings from restoring a different exposure-lock value. The CLI remains independently configurable and keeps its parser default of `pass2`.
+### 6.1 Tone restoration
 
-### 6.1 Selective highlight recovery
+The neural passes compress the tonal range. Shadows are lifted and highlights are pulled down, so the processed image is globally flatter than the source even when the exposure/DC component is locked. This is a change to the tone curve rather than to any band, which means none of the band-focused cleanup stages can see it or repair it.
 
-The neural correction can occasionally pull very bright source highlights downward even when the global exposure/DC component is locked. Flicker Suppressor therefore performs a final selective luminance recovery after neural and deterministic cleanup.
+Tone restoration runs at the end of the pipeline, after all cleanup stages and before orientation is restored. It measures the tone of the processed image against the tone of the original oriented source and applies a monotone correction that puts the contrast and gamma back.
 
-The recovery compares the processed Y channel with the **original oriented source Y**. It only restores luminance that processing removed; it never darkens a pixel or replaces corrected chroma. A smooth source-luminance gate begins at Y `0.90` and reaches full weight at Y `0.99`, so shadows, midtones, and ordinary bright surfaces are unaffected. The default recovery strength is `1.0` (100%). Gamut-safe YCbCr recombination is used after recovery.
+**Fitting on envelopes.** Both sides of the comparison are smoothed along the band axis before the tone curve is fitted, so the flicker itself does not contaminate the measurement. Matching against a still-banded reference would fold band structure into the tone curve.
 
-The GUI exposes only **Highlight recovery**. Advanced CLI users can also change the gate endpoints with `--highlight-recovery-start` and `--highlight-recovery-full`. Set `--highlight-recovery-strength 0` to reproduce the pipeline without this final recovery.
+**Applying in log space.** The correction is applied as a smooth additive offset to log luminance:
+
+```text
+delta   = log(mapped_envelope + eps) - log(envelope + eps)
+delta   = smooth_along_band(delta)
+output  = exp(log(processed + eps) + delta) - eps
+```
+
+Because `log(output + eps)` equals `log(processed + eps)` plus a field that carries no band-frequency content, the periodic residual passes through unchanged. This matters: a tone curve applied directly to full-resolution luminance is non-linear, and re-expands the very bands the earlier stages removed.
+
+**Highlight headroom.** Positive corrections are limited by the luminance still available before clipping, using the same limiter the residual profile stage applies. Restoring contrast raises luminance, and without the limiter a bright light source is pushed past `1.0` and flattened into a featureless white disc.
+
+**Band period.** When a validated band period is available, it is used for the envelope smoothing. When it is not, the stage falls back to no band smoothing, which is safe but slightly less precise: the tone fit is then made on unsmoothed luminance.
+
+GUI controls under **Tone restoration**:
+
+- **Tone restoration** - on by default;
+- **Restoration strength** - default `1.00`, range `0-1`. At `1.00` the output tone matches the source most closely; lower values apply a proportionally smaller correction.
+
+CLI equivalents are `--tone-restore` / `--no-tone-restore` and `--tone-restore-strength`. Two further options exist but are not exposed in the GUI: `--tone-restore-max-gain` is a safety clamp that ordinary images do not approach, and `--tone-restore-min-confidence` selects which period the envelope smoothing uses rather than whether the stage runs.
 
 ---
 
@@ -309,84 +287,144 @@ Enable with:
 --flat-profile
 ```
 
-This stage is different from the local flattener. It is designed for faint globally coherent residual bands on **textured** surfaces. It can be enabled independently of `--flat-filter`; the two stages share tone/edge support machinery but apply different corrections.
+This stage is different from the local flattener. It is designed for globally coherent residual bands even when the scene is textured. It can run with or without Restormer and independently of `--flat-filter`.
 
-It:
+Residual Profile has two waveform modes:
 
-1. uses tone/edge-safe pixels without requiring them to be locally flat;
-2. forms robust cross-column row measurements using Huber-like outlier rejection;
-3. detects a band-period family with a multiscale/harmonic-aware spectrum;
-4. separates narrow residual structure from slower baseline illumination;
-5. keeps that period/phase/waveform global, but by default fits a **slowly varying local amplitude** for it;
-6. applies the resulting Y/Cb/Cr correction without blurring scene texture.
+- **Smooth periodic** (`--flat-profile-mode smooth`) for sinusoidal/rounded residuals. It keeps the established harmonic-aware period estimator, slowly varying adaptive amplitude, surface handoff, and band-coherent no-harm validation.
+- **PWM / Step** (`--flat-profile-mode pwm`) for strobed/PWM LEDs with square-ish plateaus, sharp transitions, or a strong harmonic family. PWM mode uses a separate timing/fitting system described below.
 
-The adaptive-amplitude step addresses scenes where the same flicker waveform is present at different strengths on foreground and background surfaces. It does **not** estimate an independent profile in each tile or object: the robust global period/phase/waveform remains the reference. The local multiplier is fitted from the **band-limited residual belonging to that same frequency family**, which prevents broad wall shading, faces, clothing, and other unrelated low-frequency scene structure from becoming patch-shaped gain islands.
+### 9.1 Fundamental-first PWM Auto period
 
-Adaptive amplitude is on by default. The current defaults use a relatively broad 1.50-period vertical fit, require stronger local waveform correlation (`0.15` to begin, `0.45` for full evidence), and cap the local multiplier at `1.0`. Thus adaptive mode attenuates weakly supported areas by default but does not silently amplify the profile above the user's selected global strength. For regression comparison, `--no-flat-profile-adaptive` restores the previous single global profile amplitude.
+The PWM detector does not rely on ordinary image-spectrum power alone. It builds a scene-resistant signed transition signal by lightly smoothing texture, differentiating along the band direction, robustly normalizing each perpendicular column/row, and taking a cross-scene median. A real rolling-shutter PWM transition repeats across much of the frame; an object edge usually remains a minority event.
 
-A second **no-harm gate** is also enabled by default. It evaluates the actual proposed profile correction, including application mask and user-selected strength, in the same band-limited domain before and after correction. Unlike the earlier 2-D validator, the current gate is deliberately **band-coherent**: validation evidence is collapsed across the waveform axis, broadly smoothed only along the band direction, and then expanded back over the waveform axis. It can therefore attenuate a profile in a large scene zone where that waveform would make the residual worse, while being mathematically unable to trace a blurred person/object silhouette or modulate individual bright/dark bands. `--no-flat-profile-no-harm` is retained for regression comparison.
+Auto period then computes positive-lag autocorrelation on that transition signal. Dense straight PWM can produce an almost flat ladder of excellent peaks at `P`, `2P`, `3P`, ... and very large lags. The current **fundamental-first** rule therefore does not blindly take the absolute largest peak. When local maxima are nearly tied, it prefers the shortest candidate that:
 
-When **Residual profile** and **Flat-region cleanup** are enabled together, a final **dominant-surface handoff** prevents the two stages from fighting each other at high profile strength. Profile estimation, adaptive gain, exposure/DC anchoring, and no-harm validation are completed first. Only after those calculations, one large connected, color-consistent smooth surface is selected as the surface primarily owned by Flat-region cleanup. This avoids the earlier broadly blurred ownership mask, which could leak from a background wall into smooth foreground skin. The selected surface receives a lightly feathered cap on the *visible* profile contribution. The current internal cap is an effective profile strength of `0.50`; profile strengths at or below `0.50` are unchanged on that surface. Foreground/textured or differently colored smooth regions retain the user's full requested profile strength. The handoff is reduced proportionally if the local flat Y/C strength is deliberately set below its normal `0.70`/`0.85` authority, and it is disabled entirely when Flat-region cleanup is off. This lets a user drive Residual profile hard for banded skin/clothing without painting broad bright/dark profile lobes into smooth defocused walls.
+- is within roughly 1.5% of the best autocorrelation score;
+- still gives at least five visible cycles in the frame;
+- contains two opposite recurrent transition phases compatible with the configured PWM duty limits.
 
-For intentionally aggressive profile strengths above `1.0`, the handoff uses a **one-sided boundary transition** rather than an abrupt wall/foreground switch. The selected background surface is extended a short distance outward and smoothly released into the foreground. This protects the background immediately behind a defocused silhouette while returning to the user's full strength over the foreground interior, avoiding both the earlier background blobs and the later hard halo that appeared when the cap changed too sharply at a head/object boundary.
+This prevents a real fine fundamental from being replaced by an arbitrary large harmonic/autocorrelation plateau. Broad PWM with only a few visible cycles is intentionally not forced down to an unsupported short period.
 
-There are two additional high-strength safeguards. First, bright soft scene edges combine the ordinary edge support with the broad/defocus structure support; when Y or C profile strength is above `1.0`, the visible profile contribution around such bright boundaries is locally capped to an effective strength of `0.50`. Darker skin/face interiors are not targeted by this bright-edge gate. Second, positive luminance-profile corrections on already-bright detail are limited by the remaining highlight headroom, with the limiter fading in through the bright range. Negative corrections are left untouched. This reduces bright flowers, pale masks, specular details, and similar features being pushed into local glow/halo artifacts when Residual profile is deliberately driven hard.
+A manual `--flat-profile-band-period` remains exact. Auto-only refinement never rescales a user-supplied manual period.
 
-Useful strengths:
+### 9.2 Optional Restormer timing evidence
 
-```text
-0.35  default conservative cleanup
-0.50  strong residual cleanup
-0.7-1.0 very strong
-1.0-1.2 extreme, strongly periodic residuals
-1.5-2.0 intentionally aggressive; useful only when the foreground needs it and should be inspected carefully
-```
+When Restormer is enabled, PWM mode also receives the **cumulative source -> post-neural** log-luminance gain and Cb/Cr delta. This fixes the earlier two-pass problem where using only the final pass could discard the stronger first-pass timing evidence. The neural correction is used as timing/validation evidence; its magnitude is not blindly copied into the final cleanup.
 
-For a known fine period, for example 37 px:
+If Restormer is disabled, or if its PWM-frequency energy is weak, the image-side residual transition detector remains sufficient for the direct PWM paths. This is an intentional supported workflow rather than an error condition.
+
+### 9.3 Single-source phase lock
+
+For a dominant PWM family, Flicker Suppressor checks whether the same fundamental phase recurs across several widely separated perpendicular scene strips. When phase coherence is very strong, the period is refined locally for maximum cross-scene phase agreement and the correction enters **phase-locked mode**:
+
+- one global period/phase is frozen for the whole sensor axis;
+- radiometrically coherent regions may have different local amplitudes;
+- regions are not allowed to invent unrelated local phases;
+- local fields are validated against held-out/independent evidence before gaining authority.
+
+This is especially useful when a single lamp produces straight bands over wall, skin, clothing, and other surfaces whose visible PWM amplitude differs because of brightness/color/camera response.
+
+### 9.4 Multiple PWM sources
+
+If the image contains evidence for more than one independent timing family, PWM mode can discover additional candidates from multi-region timing/spectral evidence. Small-integer harmonic-related candidates are grouped so one square wave is not falsely reported as several lamps. Independent validated period families are represented jointly with harmonic sine/cosine bases and fitted over radiometric regions, allowing different surfaces to carry different source mixtures.
+
+This supports cases where multiple LED sources have different periods, band widths, phases, or spatial influence. It remains conservative when the single image cannot separate the sources: exact harmonic relationships, too few visible cycles, heavy clipping, or real scene structure at the same timing can be fundamentally ambiguous.
+
+### 9.5 Surface/cycle fallback models and no-harm policy
+
+When the strongest phase-lock conditions do not hold, PWM mode can fall back through global cycle consensus, held-out surface-conditioned fitting, segmented multi-source fitting, and conservative direct step/smooth paths. The key safety policy is hierarchical: a local model must explain recurrent PWM structure better than a safer parent model; otherwise authority shrinks or falls back rather than forcing a correction.
+
+Cb and Cr share the timing family but keep independent signed channel amplitudes. Luminance is modeled in a log-like domain where practical because illumination flicker is closer to multiplicative than additive. Positive corrections near bright highlights are headroom-limited.
+
+### 9.6 Optional final PWM polish
+
+The optional final polish is a **post-residual projection**, not a new detector:
 
 ```powershell
---flat-profile `
---flat-profile-band-period 37 `
---flat-profile-luma-strength 1.00 `
---flat-profile-chroma-strength 0.80
+--flat-profile-pwm-polish `
+--flat-profile-pwm-polish-strength 1.0 `
+--flat-profile-pwm-polish-passes 2
 ```
+
+It runs after the main Residual profile and local flat cleanup, reusing **only period families already validated by the main PWM stage**. It measures remaining exact PWM-mode energy, fits a constrained surface-aware residual field, and performs an internal authority search. A candidate pass is accepted only if the validated PWM-mode energy decreases and nearby control frequencies do not increase excessively.
+
+**Stopping criterion.** The loop stops when the remaining residual is no longer phase-coherent with the band. Coherence is measured against the band's own phase, so it distinguishes a residual still in phase with the band - which further passes can remove - from one already driven past zero, which further passes would only invert. Energy magnitude cannot make that distinction: it reports the same value either way, so a magnitude-based stop keeps running after the band is gone and buys apparent progress by overshooting.
+
+Because the stage stops on evidence, the configured maximum is an upper bound rather than a value that needs tuning per image. Raising it does not make the polish more aggressive on an image that has already converged.
+
+GUI controls:
+
+- **Enable final PWM polish** - default off;
+- **PWM polish strength** - default `1.00`, range `0-1.25`;
+- **PWM polish max passes** - default `2`, range `1-6`. This is a ceiling; the stage stops earlier when the residual stops being a band.
+
+The Residual paint mask also gates the visible polish correction. In the desktop GUI, Final PWM polish is available only when **PWM / Step** is selected. The polish checkbox, strength, and max-pass controls are disabled/greyed out in **Smooth periodic** mode; switching back to PWM mode makes them available again without changing the stored checkbox value.
 
 ---
 
-## 10. Dominant large-surface equalizer
+## 10. Broad residual cleanup
 
-Enable with:
+Enable the stage with:
 
 ```powershell
 --flat-surface-equalizer
 ```
 
-This is for a different regime: only a few very broad residual cycles remain on one large surface, and ordinary frequency separation cannot clearly distinguish flicker from real illumination.
+The stage has two algorithms selected by `--flat-surface-equalizer-mode`. The desktop GUI exposes the same choice as **Broad mode**. The current default is **`consensus` / Multi-surface consensus**. `dominant` remains available explicitly for the original one-large-surface behavior. Existing saved JSON files that explicitly contain `"flat_surface_equalizer_mode": "dominant"` keep that saved choice.
 
-The equalizer:
+### 10.1 Dominant surface mode
 
-- finds one dominant large, color-consistent surface;
-- estimates robust Y/Cb/Cr values per row;
-- fits a low-order polynomial baseline (quadratic by default) representing legitimate illumination/color drift;
-- treats departures from that baseline as residual flicker;
-- applies only the row correction to the selected surface;
-- feathers the surface boundary.
+```powershell
+--flat-surface-equalizer `
+--flat-surface-equalizer-mode dominant
+```
 
-It is intentionally opt-in because it makes a stronger assumption than the normal profile filter. It can be enabled independently of both `--flat-filter` and `--flat-profile`.
+This is the original broad/few-cycle equalizer. It is for a large wall or other one dominant color-consistent surface where ordinary frequency separation cannot clearly distinguish flicker from real illumination. It finds one dominant surface, measures robust Y/Cb/Cr values per processing row, fits a low-order polynomial baseline, and treats departures from that baseline as residual flicker. The correction is feathered only over the selected surface.
 
----
+### 10.2 Multi-surface consensus mode
 
-### 10.1 Cleanup-stage independence
+```powershell
+--flat-surface-equalizer `
+--flat-surface-equalizer-mode consensus
+```
+
+This mode targets a different failure case: a very broad residual is visible with the same phase across multiple unrelated surfaces, while no single dominant-surface segmentation is trustworthy enough to describe the whole artifact. It is specifically allowed to handle **sub-cycle / single-trough** residuals where less than one complete flicker period is visible inside the frame.
+
+With Restormer enabled, the preferred implementation is **neural-guided for both luminance and chroma**. Before deterministic cleanup, Flicker Suppressor derives the cumulative full-resolution neural log-luminance gain and cumulative Cb/Cr delta between the oriented source and the post-neural image. With Restormer disabled, luminance consensus falls back to image-only cross-region agreement; consensus chroma is conservatively disabled because the current vector-direction validator requires a neural Cb/Cr hint. Those neural corrections are not blindly reapplied. When present they are used only as validation evidence: in the row-oriented processing domain the image is divided into several large independent processing-X regions, each region receives its own robust row measurement and its own affine Y/CbCr baseline, and a common broad residual must be found in multiple widely separated regions. In the neural-guided luminance path the residual must oppose the neural gain, which is the signature of a broad under-correction. The image-only luminance fallback instead relies on cross-region waveform agreement and bounded no-harm authority. Guided chroma uses the magnitude of the two-channel vector correlation with the neural Cb/Cr change, because a remaining color cast can represent either under-correction or an overshot/model-introduced shift; the accepted scene regions must still agree positively with one another before any chroma correction is allowed.
+
+Once validation passes, the broad residuals from the agreeing regions are robustly combined into row-coherent Y and Cb/Cr waveforms. Luminance and chroma receive separate least-squares no-harm fits. **Broad luminance strength** and **Broad chroma strength** are maximum authorities; consensus mode does not intentionally overshoot either fitted minimum-energy amplitude. The chroma fit treats Cb and Cr as one two-dimensional vector and uses one scalar authority for the shared vector waveform, so it cannot independently overdrive one channel and rotate the estimated hue shift. Near-white pixels also receive a positive-luminance headroom guard so broad recovery does not turn windows or specular highlights into clipped white slabs.
+
+After a primary luminance consensus has been accepted, the stage performs at most **one automatic residual refinement pass**. It re-measures the already-corrected image using the validated first-pass waveform as a template, so it cannot invent a new broad pattern. Because the first pass has already established cross-surface agreement, the refinement may accept a small remainder supported by only two current regions, but the combined remainder must still correlate strongly with the original validated waveform and pass a fresh least-squares no-harm fit. Extra authority is capped internally to 35% of the normal luminance authority (and never above 0.35 absolute), with the same near-white positive-correction guard. There is intentionally no additional GUI slider for this refinement.
+
+Scene regions influence the evidence only. The accepted automatic correction remains one-dimensional and constant across processing X, so the estimator cannot draw wall/person/object silhouettes into the correction. The existing GUI **Broad** mask still gates the final visible delta when manual localization is desired.
+
+Default consensus safeguards are:
+
+- 6 large independent regions;
+- at least 2 agreeing, widely separated regions;
+- in the neural-guided path, neural/residual correlation confidence begins at `0.55` and reaches full confidence at `0.80`; the image-only luminance fallback uses the same thresholds for cross-region agreement;
+- per-region **affine** baseline removal, deliberately avoiding the previous quadratic + very-slow high-pass combination that could erase a single broad dark trough;
+- robust cross-region median/MAD clipping before waveform averaging;
+- separate least-squares no-harm amplitude fits bounded by Broad luminance/chroma strength;
+- one optional template-locked luminance refinement after a validated first pass, capped to 35% extra authority and rejected unless the remaining waveform still matches the first consensus;
+- vector-aware Cb/Cr direction agreement and a single chroma authority that preserves the estimated hue-shift direction;
+- zero-DC Cb/Cr correction so the stage removes spatial color variation without changing the global color balance;
+- luminance highlight headroom protection.
+
+This mode is intended for cases where the same broad luminance and/or chroma residual can be measured independently on unrelated surfaces while the dominant-surface equalizer and ordinary periodic profile have little usable authority.
+
+### 10.3 Cleanup-stage independence
 
 The three deterministic cleanup stages are independently switchable:
 
 - `--flat-filter` enables the local flat-region correction only;
 - `--flat-profile` enables the global robust residual row-profile correction only;
-- `--flat-surface-equalizer` enables the dominant large-surface equalizer only.
+- `--flat-surface-equalizer` enables Broad residual cleanup; `--flat-surface-equalizer-mode dominant|consensus` selects its algorithm.
 
 They deliberately share tone/edge support calculations and can be combined, but none of these three switches is a prerequisite for the others. `--orthogonal-profile` is separate again: it adds an orthogonal profile pass after the primary-axis processing and reuses the residual-profile algorithm in the perpendicular direction.
 
-When the main Residual profile and Flat-region cleanup are both enabled, the profile stage is applied **first**. The local flat-region correction is then estimated from what remains, so local support-mask artifacts are not fed back into the adaptive profile fit. The dominant large-surface equalizer, when enabled, runs after those two corrections.
+When the main Residual profile and Flat-region cleanup are both enabled, the profile stage is applied **first**. The local flat-region correction is then estimated from what remains, so local support-mask artifacts are not fed back into the adaptive profile fit. Broad residual cleanup, when enabled, runs after those two corrections.
 
 GUI paint masks do not change that estimation order. The Residual mask gates the main profile and optional Orthogonal profile at application time; the Flat mask gates the local flat correction after its horizontal regularization and also limits where Flat-region cleanup may claim ownership for the profile handoff; the Broad mask gates only the final large-surface-equalizer delta after the equalizer has fitted its automatically selected surface.
 
@@ -562,15 +600,23 @@ Use this when one orientation has been corrected well but a second orthogonal st
 
 Orthogonal cleanup is independently opt-in and reuses the robust residual-profile algorithm in the perpendicular direction; it does not run the neural models twice. The main `--flat-profile` switch does not need to be enabled. `--band-axis both` remains accepted as a legacy shortcut for horizontal primary processing plus this orthogonal pass.
 
-### 12.9 Very broad/few-cycle residuals on one dominant surface
+### 12.9 Very broad/few-cycle residuals
 
-Use this only when a large surface such as a wall still shows a few extremely broad bands or waves that ordinary period-based cleanup cannot distinguish reliably from real illumination gradients.
+For one dominant wall/surface, keep the default Broad mode:
 
 ```powershell
---flat-surface-equalizer
+--flat-surface-equalizer `
+--flat-surface-equalizer-mode dominant
 ```
 
-The large-surface equalizer makes a stronger assumption than the normal profile filter: it identifies one dominant, color-consistent surface and fits a low-order illumination/color baseline through it. Inspect the result carefully, and use `--debug-dir` if you want to verify the selected surface mask.
+If the same broad **luminance or color** variation is visible across several unrelated surfaces and dominant-surface mode does little, try:
+
+```powershell
+--flat-surface-equalizer `
+--flat-surface-equalizer-mode consensus
+```
+
+Consensus mode requires agreement across independent large regions and applies row-coherent Y/CbCr corrections rather than scene-shaped 2-D corrections. The chroma path treats Cb/Cr as one vector and preserves global chroma DC. If only part of the image should receive the accepted correction, use the GUI Broad mask.
 
 ### 12.10 If the local flat filter alters people, objects, or small smooth regions
 
@@ -619,6 +665,35 @@ Avoid enabling every stage at maximum strength by default. The safest result is 
 
 ---
 
+
+### 12.13 PWM case where Restormer is unhelpful
+
+If Restormer visibly changes the image but does not reduce the PWM bands, disable it and let the deterministic PWM detector work from the source:
+
+```powershell
+--no-restormer `
+--flat-profile `
+--flat-profile-mode pwm
+```
+
+Leave Profile period on Auto first. The fundamental-first detector can lock directly from repeated transition coherence. If the frame is unusually ambiguous, a manually measured Profile period remains the exact fallback.
+
+If Restormer is partly useful rather than completely useless, keep it enabled and reduce only the problematic first-pass component with **First-pass luminance strength** or **First-pass chroma strength**.
+
+### 12.14 Correct PWM timing but faint bands remain
+
+Enable the final locked polish after the main PWM correction:
+
+```powershell
+--flat-profile-pwm-polish `
+--flat-profile-pwm-polish-strength 1.0 `
+--flat-profile-pwm-polish-passes 4
+```
+
+The pass count is a ceiling: the stage stops on its own when the remaining residual is no longer phase-coherent with the band, so raising it does not force extra correction onto an image that has already converged.
+
+Do not treat Polish strength as a simple request to overdrive the correction. The stage performs its own accepted-authority search against the exact validated PWM modes. Increase above `1.0` only after comparing the result carefully; the GUI caps the public value at `1.25`.
+
 ## 13. Full inference option reference
 
 The defaults below are taken directly from the current parser. For PowerShell color values, examples use hashless hexadecimal notation.
@@ -630,8 +705,8 @@ The defaults below are taken directly from the current parser. For PowerShell co
 | `-h/--help` | - | show this help message and exit | Run `python .\hybrid_infer_detail_preserving.py --help`. |
 | `--input` | required | Input image file or directory. Directory input is scanned recursively for supported raster formats. | Example: `--input .\photo.jpg` or `--input .\photos`. |
 | `--output` | required | Output PNG path for a single image, or output directory for directory input. | Example: `--output .\photo_restored.png` or `--output .\restored`. |
-| `--luma-model` | required | Original/standard 3-channel Restormer final.pth | Release model: `--luma-model .\models\y.pth`. |
-| `--chroma-model` | required | Fine-tuned 2-channel CbCr branch | Release model: `--chroma-model .\models\chroma.pth`. |
+| `--luma-model` | required when Restormer is on | Original/standard 3-channel Restormer final.pth. Not loaded or required with `--no-restormer`. | Release model: `--luma-model .\models\y.pth`. |
+| `--chroma-model` | required when Restormer is on | Fine-tuned 2-channel CbCr branch. Not loaded or required with `--no-restormer`. | Release model: `--chroma-model .\models\chroma.pth`. |
 | `--device` | `auto` | PyTorch device. `auto` chooses CUDA device 0 first, then Apple MPS, then CPU. Explicit CUDA indices such as `cuda:0` and `cuda:1` are supported. | Use `--device cuda:1` to choose the second visible NVIDIA GPU. The GUI enumerates detected CUDA GPUs by model name and labels Auto/CPU hardware. |
 | `--amp` / `--no-amp` | on | Enable/disable CUDA FP16 autocast. AMP is used only when the resolved device is CUDA; on CPU/MPS the flag has no effect. | Default is on for CUDA. Use `--no-amp` for an FP32 comparison. |
 | `--processing-size` | `512` | Square neural-network working resolution. Must be a multiple of 8 in the range 256–2048. Corrections are resized back to the source resolution. | Keep `512` unless benchmarking a deliberate change. |
@@ -654,7 +729,10 @@ The defaults below are taken directly from the current parser. For PowerShell co
 
 | Option | Default | Explanation | Example / tuning note |
 |---|---:|---|---|
-| `--passes` | `1` | Use 2 only for unusually severe residual bands Choices: `1`, `2`. | Use `--passes 2` only when one pass leaves strong residual bands. |
+| `--restormer` / `--no-restormer` | on | Enable/disable the neural Restormer Y/CbCr stage. When off, models are not loaded and deterministic cleanup starts from the source image. | Use `--no-restormer` for PWM frames where the neural pass is unhelpful. |
+| `--passes` | `1` | Number of Restormer passes when the neural stage is enabled. Choices: `1`, `2`. | Use `--passes 2` only when one pass leaves strong residual bands. |
+| `--first-pass-luma-strength` | `1.0` | First-pass-only multiplier for Restormer luminance correction, after the legacy global `--luma-strength`. Range `0-2`. | Lower Y without weakening neural chroma, e.g. `0.5`. |
+| `--first-pass-chroma-strength` | `1.0` | First-pass-only multiplier for Restormer Cb/Cr correction, after the legacy global `--chroma-strength`. Range `0-2`. | Lower chroma without weakening neural luminance, e.g. `0.6`. |
 | `--second-pass-strength` | `1.0` | Scale both Y and chroma corrections on pass 2 | Example: `0.70` for a gentler second pass. |
 | `--exposure-lock` | `pass2` | CLI control for removing global DC from the Y correction. Choices: `off`, `pass2`, `all`. | CLI default is `pass2`. The desktop GUI hides this option and forces `all`. |
 | `--luma-mode` | `directional` | How the Restormer Y prediction is converted into a correction field: raw, directional, directional-additive, or row. Choices: `raw`, `directional`, `directional-additive`, `row`. | Recommended: `directional`. Use `raw` only for legacy comparison. |
@@ -665,9 +743,10 @@ The defaults below are taken directly from the current parser. For PowerShell co
 | `--no-row-anchor` | off | Disable preservation of each row's mean neural correction after horizontal filtering. | Mostly diagnostic; the default anchored behavior is recommended. |
 | `--luma-strength` | `1.0` | Global multiplier for the neural luminance correction. | Example: `--luma-strength 0.8` for a globally gentler neural Y correction. |
 | `--chroma-strength` | `1.0` | Global multiplier for the neural Cb/Cr correction. | Example: `--chroma-strength 0.8` if chroma correction is globally too aggressive. |
-| `--highlight-recovery-strength` | `1.0` | Fraction of original near-white luminance restored when processing made it darker. | GUI **Highlight recovery**. `0` disables; `1` restores the full lost source Y inside the highlight gate. |
-| `--highlight-recovery-start` | `0.90` | Original/source Y where highlight recovery begins to fade in. | Advanced tuning only. Raise to restrict recovery to more extreme highlights. |
-| `--highlight-recovery-full` | `0.99` | Original/source Y where the requested highlight-recovery strength reaches full weight. | Must be greater than `--highlight-recovery-start`; normally leave at `0.99`. |
+| `--tone-restore` / `--no-tone-restore` | on | Enable/disable final tone restoration, which puts back global contrast and gamma lost during processing. | GUI **Tone restoration**. Disable only to reproduce the pre-restoration tone. |
+| `--tone-restore-strength` | `1.0` | How much of the measured tone difference is corrected. Range `0-1`. | GUI **Restoration strength**. `1.0` matches the source tone most closely; lower if midtones look over-lifted. |
+| `--tone-restore-max-gain` | `1.6` | Largest luminance gain the tone correction may apply at any level. | Safety clamp, not shown in the GUI. Ordinary images do not approach it. |
+| `--tone-restore-min-confidence` | `0.35` | Band confidence below which the stage uses a fallback period for envelope smoothing rather than the profile period. | Not shown in the GUI. The stage still runs below this threshold. |
 
 ### 13.4 Local flat-region filter
 
@@ -726,12 +805,17 @@ The GUI exposes these as Shadow cutoff and Highlight cutoff. On edit completion 
 | Option | Default | Explanation | Example / tuning note |
 |---|---:|---|---|
 | `--flat-profile` | off | Enable optional residual 1-D row-profile suppression for faint globally coherent bands | Use for residual coherent bands even on textured surfaces. |
+| `--flat-profile-mode` | `smooth` | Residual waveform model: `smooth` or `pwm`. | GUI **Profile mode**: use PWM / Step for square-ish strobe/LED plateaus with sharp repeating transitions. |
 | `--flat-profile-luma-strength` | `0.35` | Residual row-profile suppression strength for log-Y when --flat-profile is enabled | 0.50 is a strong practical preset; 0.8-1.2 may help extreme fine bands. |
 | `--flat-profile-chroma-strength` | `0.35` | Residual row-profile suppression strength for CbCr when --flat-profile is enabled | 0.50 is a strong practical preset; increase less aggressively than Y when possible. |
 | `--flat-profile-narrow-ratio` | `0.035` | Noise-suppression scale of residual profile as fraction of band period | Controls noise suppression on the 1-D residual profile. Advanced tuning only. |
 | `--flat-profile-base-ratio` | `0.4` | Baseline scale of residual profile as fraction of band period | Controls how much slow variation is treated as legitimate baseline rather than flicker. |
-| `--flat-profile-band-period` | `0.0` | Override only the residual-profile period in full-resolution pixels; 0 = multiscale auto; manual values are limited to 1–7680 px. | Force a known period such as `37`; 0 uses harmonic-aware auto detection. |
-| `--flat-profile-period-mode` | `multiscale` | Period estimator for --flat-profile; multiscale is texture tolerant and harmonic aware Choices: `multiscale`, `legacy`. | Keep `multiscale` normally. `legacy` is retained for comparison/regression. |
+| `--flat-profile-pwm-transition-ratio` | `0.010` | Transition-feather request for PWM/Step mode as a fraction of period. | Advanced. The preferred neural-seeded path keeps this request sharp but also applies a small prototype-reference finite-edge floor; residual-only fallback retains the direct ratio behavior. |
+| `--flat-profile-pwm-min-duty` | `0.08` | Minimum accepted PWM plateau duty fraction. | Advanced safety limit. |
+| `--flat-profile-pwm-max-duty` | `0.92` | Maximum accepted PWM plateau duty fraction. | Advanced safety limit. |
+| `--flat-profile-pwm-min-transition-score` | `2.0` | Minimum normalized repeated-transition evidence before PWM fitting is trusted. | Raise to make PWM acceptance stricter. |
+| `--flat-profile-band-period` | `0.0` | Override the residual-profile period in full-resolution pixels; `0` = Auto. PWM Auto uses the fundamental-first transition/autocorrelation detector plus phase validation; manual values are limited to 1-7680 px and remain exact. | Force a known period such as `37` only when Auto is genuinely ambiguous. |
+| `--flat-profile-period-mode` | `multiscale` | Base period estimator selector. Smooth mode uses the harmonic-aware multiscale estimator; PWM mode additionally uses its dedicated transition/fundamental-first detector and validated source discovery. Choices: `multiscale`, `legacy`. | Keep `multiscale` normally. `legacy` is retained for comparison/regression. |
 | `--flat-profile-period-min` | `12.0` | Smallest period considered by multiscale profile detection | Lower only if you expect extremely fine bands below 12 px. |
 | `--flat-profile-period-max-fraction` | `0.6` | Largest profile period as a fraction of image height | Raise if legitimate band periods span more than 60% of the image height. |
 | `--flat-profile-period-analysis` | `512` | Internal row-spectrum analysis height | Internal spectral-analysis height. Usually leave at 512. |
@@ -744,14 +828,18 @@ The GUI exposes these as Shadow cutoff and Highlight cutoff. On edit completion 
 | `--flat-profile-adaptive-corr-high` | `0.45` | Band-limited local waveform correlation where adaptive evidence is fully trusted | Keep above the low threshold; lower values make the adaptive profile more permissive. |
 | `--flat-profile-adaptive-max-gain` | `1.00` | Maximum local multiplier of the globally estimated profile waveform | Default 1.0 is attenuation-only: local adaptation can reduce the requested profile but cannot exceed its selected strength. |
 | `--flat-profile-no-harm` / `--no-flat-profile-no-harm` | on | Validate the actual local profile correction and suppress it where band-limited residual energy would not clearly decrease. | Keep on normally. Disable only for regression comparison with the earlier adaptive-profile behavior. |
+| `--flat-profile-pwm-polish` / `--no-flat-profile-pwm-polish` | off | Enable the optional final PWM-only projection after the main profile/local cleanup. It reuses only period families already validated by PWM mode and cannot invent a new frequency. | Enable when correct PWM timing is established but faint coherent bands remain. |
+| `--flat-profile-pwm-polish-strength` | `1.0` | Maximum public authority for final PWM polish. GUI/CLI range `0-1.25`; each candidate still goes through internal energy validation. | Start at `1.0`; raising it does not bypass no-harm acceptance. |
+| `--flat-profile-pwm-polish-passes` | `2` | Maximum accepted PWM polish passes. Range `1-6`; a pass is kept only if exact PWM-mode energy improves under the control-frequency guard, and the stage stops earlier when the residual is no longer phase-coherent with the band. | A ceiling rather than a target; raising it does not force extra correction. |
 
-### 13.7 Dominant large-surface equalizer
+### 13.7 Broad residual cleanup
 
 | Option | Default | Explanation | Example / tuning note |
 |---|---:|---|---|
-| `--flat-surface-equalizer` | off | Enable v1.7 dominant large-surface row equalizer for extremely broad/few-cycle residual bands | Use only for very broad/few-cycle residuals on one dominant surface. |
+| `--flat-surface-equalizer` | off | Enable Broad residual cleanup. | Independent of Flat-region cleanup and Residual profile. |
+| `--flat-surface-equalizer-mode` | `consensus` | Select `consensus` (current default multi-surface broad consensus) or `dominant` (original one-surface Y/CbCr equalizer). | GUI **Broad mode** defaults to **Multi-surface consensus** for new settings. |
 | `--flat-surface-equalizer-luma-strength` | `1.0` | Large-surface equalizer strength for log-luminance | Reduce below 1.0 if the equalizer over-flattens real illumination. |
-| `--flat-surface-equalizer-chroma-strength` | `1.0` | Large-surface equalizer strength for CbCr | Reduce below 1.0 if broad color correction is too aggressive. |
+| `--flat-surface-equalizer-chroma-strength` | `1.0` | CbCr strength for Broad cleanup. In `consensus` mode it is a maximum authority for the vector-aware no-harm fit. | GUI **Broad chroma strength**. Reduce below 1.0 if broad color correction is too aggressive. |
 | `--flat-surface-equalizer-degree` | `2` | Polynomial degree of the legitimate large-surface illumination/color baseline (default quadratic) | Keep 2 normally. Higher degrees can start fitting the flicker itself. |
 | `--flat-surface-equalizer-preblur` | `4.0` | Preblur used to recognize a rough textured surface as one underlying surface | Increase to recognize rougher texture as one underlying surface. |
 | `--flat-surface-equalizer-analysis` | `256` | Maximum side of low-resolution dominant-surface connected-component analysis | Larger = finer connected-component analysis but more compute. |
@@ -765,7 +853,13 @@ The GUI exposes these as Shadow cutoff and Highlight cutoff. On edit completion 
 | `--flat-surface-equalizer-feather` | `5.0` | Full-resolution feather sigma of the selected surface boundary | Higher values soften the selected-surface boundary more broadly. |
 | `--flat-surface-equalizer-row-sigma` | `2.0` | Small 1-D smoothing of robust per-row surface measurements before baseline fitting | Higher values smooth per-row surface measurements more before polynomial fitting. |
 | `--flat-surface-equalizer-huber-k` | `2.5` | Robust cross-column outlier scale for the large-surface row estimate | Lower rejects cross-column outliers more aggressively in the large-surface estimate. |
-| `--flat-surface-equalizer-min-coverage` | `0.04` | Minimum horizontal coverage of the selected surface required on a row | Raise to require more selected-surface coverage before trusting a row. |
+| `--flat-surface-equalizer-min-coverage` | `0.04` | Minimum row support used by broad estimators. | Dominant mode uses selected-surface coverage; consensus mode applies it inside each large region. |
+| `--flat-broad-consensus-regions` | `6` | Number of large independent processing-X regions used by consensus mode. | Usually leave at 6. |
+| `--flat-broad-consensus-min-regions` | `2` | Minimum mutually agreeing regions required before consensus correction is allowed. | Raise for a stricter but less sensitive consensus. |
+| `--flat-broad-consensus-corr-low` | `0.55` | Region-profile correlation where consensus confidence begins. | Higher rejects more weakly shared broad structure. |
+| `--flat-broad-consensus-corr-high` | `0.80` | Region-profile correlation where consensus confidence reaches full weight. | Must be greater than the low threshold. |
+| `--flat-broad-consensus-smooth-fraction` | `0.015` | Small row smoothing sigma as a fraction of processing height before consensus. | Removes consensus noise, not image texture. |
+| `--flat-broad-consensus-baseline-fraction` | `0.20` | Legacy/fallback very-slow baseline sigma. | Retained for direct/fallback consensus compatibility; the normal neural-guided consensus path uses affine per-region baselines instead so sub-cycle troughs are not high-pass filtered away. |
 | `--flat-allow-mean-shift` | off | Allow the local flat filter to change global Y/CbCr means | Normally leave off so local filtering preserves global Y/CbCr means. |
 
 
@@ -776,13 +870,13 @@ The GUI exposes these as Shadow cutoff and Highlight cutoff. On edit completion 
 Typical lines include:
 
 ```text
-device: cuda; AMP: True; passes=2; exposure-lock=pass2; band-axis=auto
+device: cuda; AMP: True; restormer=True; passes=2; exposure-lock=pass2; band-axis=auto
 axis: horizontal (...); scores H=... V=...
 pass 1: corr-rms=... exposure-removed=... stops gamut-compressed=...%
 pass 2: corr-rms=... exposure-removed=... stops gamut-compressed=...%
 flat-filter: blend>0.5=... support>0.5=... local-period=... profile-period=... conf=...
 profile period candidates: 100px:0.83, 50px:0.61, ...
-highlight-recovery: strength=1.00 gate=...% mean-Y-restored=... gamut-compressed=...%
+tone-restore: strength=1.00 period=...px conf=... contrast=... delta-max=... gamut-compressed=...%
 ```
 
 Interpretation:
@@ -797,7 +891,9 @@ Interpretation:
 - `conf` - profile-period confidence;
 - `profile-support` - trustworthy row-profile evidence coverage;
 - `local-safe` - fraction passing local same-surface safety;
-- `surface-eq` - fraction strongly affected by the large-surface equalizer.
+- `surface-eq` - fraction strongly affected by the large-surface equalizer;
+- `contrast` (tone-restore) - contrast of the result relative to the source, where `1.000` means the tone matches;
+- `delta-max` (tone-restore) - largest tone correction applied, in log units.
 
 ---
 
@@ -858,6 +954,34 @@ Use the corresponding GUI **Mask** for Flat-region cleanup, Residual profile, or
 
 Use `--flat-profile`; do not simply increase local flat-filter strength.
 
+### PWM bands remain after Restormer, or Restormer is not helping
+
+Try the PWM profile directly without neural inference:
+
+```powershell
+--no-restormer `
+--flat-profile `
+--flat-profile-mode pwm
+```
+
+The current Auto detector can estimate timing from image-side repeated transitions. If neural correction is partly useful, keep Restormer enabled and reduce only **First-pass luminance strength** or **First-pass chroma strength**.
+
+### Auto PWM period locks onto a large multiple/harmonic
+
+The current fundamental-first detector is designed to reject near-tied large autocorrelation plateaus by validating the shortest recurrent candidate with enough cycles and opposite transition phases. If an unusual frame is still ambiguous, inspect the debug period candidates and supply `--flat-profile-band-period` manually. A manual value is exact.
+
+### Correct PWM timing is found but faint lines remain
+
+Enable the final PWM polish:
+
+```powershell
+--flat-profile-pwm-polish `
+--flat-profile-pwm-polish-strength 1.0 `
+--flat-profile-pwm-polish-passes 2
+```
+
+The polish stage only reuses already-validated PWM families. It stops/reverts a candidate pass when the exact PWM-mode energy does not improve safely.
+
 ### Very fine regular bands remain
 
 Raise profile strength and optionally force the measured period:
@@ -875,7 +999,7 @@ Use `--band-axis vertical`. If both orientations are present, keep the appropria
 
 ### Broad/few-cycle residual remains on one wall
 
-Try `--flat-surface-equalizer`; inspect the selected region in the debug output before making it part of a default workflow.
+The default Broad mode is now `consensus`, which is appropriate when the same broad residual is shared across unrelated regions. For a residual that is clearly confined to one dominant wall/surface, switch explicitly to `--flat-surface-equalizer-mode dominant`.
 
 ---
 
@@ -963,16 +1087,18 @@ The current GUI groups controls as follows.
 
 #### Restormer correction
 
-1. Band direction - `Auto`, `Horizontal`, `Vertical`;
-2. Device - dynamic hardware-labelled Auto/CUDA/CPU entries and MPS when available;
-3. Use FP16 / AMP - checked by default, editable for Auto/CUDA, greyed out for explicit CPU/MPS;
-4. Processing size - default `512`, constrained to `256-2048` and normalized to a multiple of 8;
-5. Passes - `1` or `2`;
-6. Second-pass strength - enabled only for two passes;
-7. Luminance mode - `Directional`, `Directional additive`, `Row`, `Raw`;
-8. Highlight recovery - default `1.0`, range `0-1`.
+1. **Enable Restormer correction** - **off by default in the desktop GUI** for new images and after Reset. When off, neural model loading/inference is skipped and Restormer-only controls are greyed out. The CLI default remains on for backward compatibility;
+2. Band direction - `Auto`, `Horizontal`, `Vertical`; intentionally remains editable even when Restormer is off because deterministic cleanup uses the same orientation;
+3. Device - dynamic hardware-labelled Auto/CUDA/CPU entries and MPS when available;
+4. Use FP16 / AMP - checked by default, editable for Auto/CUDA while Restormer is enabled, greyed out when Restormer is off or explicit CPU/MPS is selected;
+5. Processing size - default `512`, constrained to `256-2048` and normalized to a multiple of 8;
+6. Passes - `1` or `2`;
+7. First-pass luminance strength - default `1.00`, range `0-2`;
+8. First-pass chroma strength - default `1.00`, range `0-2`;
+9. Second-pass strength - enabled only when Restormer is on and Passes = 2;
+10. Luminance mode - `Directional`, `Directional additive`, `Row`, `Raw`.
 
-The GUI hides `--exposure-lock` and forces `all`. The highlight gate endpoints remain advanced CLI-only settings.
+The GUI hides `--exposure-lock` and forces `all`. Disabling Restormer preserves the current values of its greyed-out controls rather than resetting them.
 
 #### Flat-region cleanup
 
@@ -988,22 +1114,40 @@ Object-edge protection distance is local-filter-only and is disabled when Flat-r
 #### Residual profile
 
 - Enable residual profile;
+- Profile mode - `Smooth periodic` or `PWM / Step`;
 - Profile luminance strength;
 - Profile chroma strength;
-- Profile band period (px), with an **Auto** checkbox;
+- Profile band period (px), a dropdown offering **Auto**, any candidates found by Essential editing settings, and **Custom...**;
+- Enable final PWM polish - default off;
+- PWM polish strength - default `1.00`, range `0-1.25`;
+- PWM polish max passes - default `2`, range `1-6`;
 - Enable orthogonal cleanup;
 - Orthogonal luminance strength;
 - Orthogonal chroma strength.
 
-Main Residual profile is independent of Flat-region cleanup. Orthogonal cleanup reuses the same residual-profile algorithm in the perpendicular axis but is independently opt-in and does not require the main Residual profile checkbox.
+Main Residual profile is independent of Flat-region cleanup. **Smooth periodic** remains the waveform default. **PWM / Step** uses the fundamental-first Auto detector, optional cumulative Restormer timing evidence, global phase locking when one source is strongly coherent, and multi-source/radiometric fitting when the evidence requires more than one independent period family. Restormer correction magnitude is never directly re-applied by the PWM fitter.
 
-When Profile band period Auto is checked, the effective value passed to inference is `0`, which means harmonic-aware automatic detection. When Auto is unchecked, manual periods are limited to `1-7680` full-resolution pixels.
+When **Auto** is selected, the effective value passed to inference is `0` and the PWM Auto detector validates recurrent transition timing, avoiding arbitrary near-tied large multiples. When Essential editing settings has analysed the image, its candidate periods appear as further entries, each labelled with its cycle count and marked as a harmonic or an independent alternative; selecting one passes that exact value. **Custom...** enables the numeric field, where manual periods are limited to `1-7680` full-resolution pixels and are treated as exact.
+
+**Final PWM polish** runs only for PWM / Step when the main Residual profile is enabled. It reuses validated period families after the normal residual/local cleanup and accepts up to the configured number of passes only when exact PWM-mode energy improves. Its checkbox, strength, and max-pass controls grey out when **Smooth periodic** is selected or when the parent profile conditions are inactive; switching back to PWM / Step restores their availability.
+
+Orthogonal cleanup reuses the selected residual-profile waveform mode in the perpendicular axis but is independently opt-in and does not require the main Residual profile checkbox.
 
 #### Broad residual cleanup
 
-- Enable large-surface equalizer.
+- Enable broad residual cleanup;
+- Broad mode - `Dominant surface` or `Multi-surface consensus`;
+- Broad luminance strength - default `1.00`, GUI range `0-2`;
+- Broad chroma strength - default `1.00`, GUI range `0-2`.
 
-This stage is independent of the local Flat-region cleanup and the main Residual profile switch.
+**Multi-surface consensus is the default for new settings.** `Dominant surface` preserves the original one-surface Y/CbCr equalizer. With Restormer enabled, Multi-surface consensus can validate shared broad Y and Cb/Cr residual waveforms against cumulative neural correction direction; with Restormer disabled, luminance has an image-only consensus fallback while consensus chroma is withheld without its neural direction hint. The stage is independent of Flat-region cleanup and the main Residual profile switch. Both modes use the same Broad paint mask. In consensus mode the two strength controls are maximum authorities because the Y and chroma no-harm fits may deliberately stop below the selected values.
+
+#### Tone restoration
+
+- Enable tone restoration - **on by default**;
+- Restoration strength - default `1.00`, range `0-1`.
+
+This stage restores global contrast and gamma lost during processing. At `1.00` the output tone matches the source most closely; lower values apply a proportionally smaller correction. It is independent of every cleanup stage and has no paint mask, because the correction it applies is global rather than regional. `--tone-restore-max-gain` and `--tone-restore-min-confidence` exist on the command line but are not shown here: the first is a safety clamp ordinary images do not approach, the second selects which period the envelope smoothing uses rather than whether the stage runs.
 
 #### Per-stage paint masks
 
@@ -1029,15 +1173,19 @@ Only one cleanup mask can be edited at a time. The canvas automatically switches
 
 Paint masks are stored per image at full display resolution. The first time a cleanup stage/mask is enabled, Flicker Suppressor lazily authors a full-coverage (`alpha = 1`) mask, which is equivalent to unrestricted legacy behavior but removes the ambiguity between an untouched mask and a deliberately erased one. **Eraser** is the default selected tool. From then on, the stage's final visible correction is multiplied by mask alpha, including soft feather/opacity transitions. Erasing all alpha leaves an authored empty mask and therefore disables that stage everywhere until Brush or Invert adds coverage again.
 
-The masks are final application gates rather than estimation masks. For Flat-region cleanup, the mask is applied after horizontal correction-field regularization so regularization cannot leak visible correction beyond a painted edge; the Flat mask also restricts the dominant-surface ownership handoff used to protect Residual profile. For Residual profile, the same painted mask gates both the main profile correction and the optional Orthogonal cleanup pass. For Broad residual cleanup, the equalizer still fits the full automatically selected large surface, then the painted mask gates only the final equalizer delta.
+The masks are final application gates rather than estimation masks. For Flat-region cleanup, the mask is applied after horizontal correction-field regularization so regularization cannot leak visible correction beyond a painted edge; the Flat mask also restricts the dominant-surface ownership handoff used to protect Residual profile. For Residual profile, the same painted mask gates both the main profile correction and the optional Orthogonal cleanup pass. For Broad residual cleanup, the selected mode estimates from its normal full-image evidence, then the painted mask gates only the final visible broad delta.
 
 Masks are session/per-image editing data, not parser options. Editing a mask marks the current preview stale so Preview/Export recomputes the image. Copy/Paste editing settings deliberately does not copy image-specific mask geometry, and the developer JSON export does not embed mask pixels.
 
-#### Export settings (dev)
+#### Export/import settings (dev)
 
-The **Export json** button writes the complete processing namespace for the current activated image as human-readable UTF-8 JSON.
+The developer utility contains two vertically stacked buttons: **Export json** followed by **Import json**.
 
-The JSON includes both visible values and GUI-hidden parser defaults, plus GUI policy such as `exposure_lock = "all"`. Machine-specific plumbing is excluded: input/output paths, model paths, debug directory, and overwrite behavior are not written. Painted cleanup-mask pixels are also not embedded in this JSON because they are image-specific GUI/session data rather than parser settings.
+**Export json** writes the complete processing namespace for the current activated image as human-readable UTF-8 JSON. The JSON includes both visible values and GUI-hidden parser defaults, plus GUI policy such as `exposure_lock = "all"`. Current visible PWM/Restormer state is therefore exported explicitly, including `restormer`, `first_pass_luma_strength`, `first_pass_chroma_strength`, `flat_profile_pwm_polish`, `flat_profile_pwm_polish_strength`, and `flat_profile_pwm_polish_passes`. Machine-specific plumbing is excluded: input/output paths, model paths, debug directory, and overwrite behavior are not written. Painted cleanup-mask pixels are also not embedded in this JSON because they are image-specific GUI/session data rather than parser settings.
+
+**Import json** reads a Flicker Suppressor processing-settings JSON for the current activated image. The file is parsed and fully validated before any setting is applied. The importer rejects malformed JSON, a non-object/empty top-level value, unknown processing keys, wrong JSON value types, invalid parser choices, non-finite numeric values, values outside the supported GUI ranges, malformed Shadow/Highlight RGB hex colors, and a Shadow cutoff that is brighter than the Highlight cutoff. Device strings are limited to `auto`, `cpu`, `mps`, `cuda`, or `cuda:<index>`. Processing size must be a multiple of 8 from 256 to 2048, manual Profile period must be Auto (`0`) or 1-7680 px, and PWM polish passes must be 1-3.
+
+Current complete exports and older/partial exports are both accepted as long as every supplied key is known and valid. Missing settings are filled from the current GUI/parser defaults, then the recipe is normalized through the same inference namespace policy used by processing/export. Successful import replaces the current image's processing recipe, marks its preview stale (`dirty = true`), reloads the visible controls, and preserves any authored stage masks. If an imported recipe enables a masked cleanup stage that has never authored a mask, the normal full-coverage mask is created. Mask pixels themselves are never imported from developer JSON.
 
 ### 19.4 Per-setting reset, editing and validation
 
@@ -1054,13 +1202,15 @@ Important GUI validation rules:
 - Processing size: clamp to `256-2048`, then normalize to the nearest multiple of 8;
 - Object-edge protection distance: clamp to `0-100`;
 - manual Profile band period: clamp to `1-7680 px`; Auto uses internal `0`;
+- First-pass luminance/chroma strengths: `0-2`;
 - Second-pass strength: `0-2`;
 - primary profile luminance/chroma strengths: `0-4`;
+- PWM polish strength: `0-1.25`; PWM polish passes: `1-6`;
 - orthogonal profile strengths: `-1-4`, where `-1` means reuse the corresponding primary-profile strength;
 - Shadow/Highlight text: canonicalize to `#RRGGBB`, with safe black/white fallback and ordering correction.
 - Mask Brush/Eraser Size: `1-1000 px`; Feather: `0-1000 px`; Opacity: `1-100%`; Brush and Eraser keep independent values per cleanup section.
 
-The same normalization is applied before GUI inference and developer JSON export, so older/pasted settings cannot bypass these ranges.
+The same normalization is applied before GUI inference and developer JSON export, so older/pasted settings cannot bypass these ranges. Developer JSON **import** is stricter: it validates the complete file first and aborts without changing the current recipe if any supplied key/value is invalid. Missing known fields are allowed and filled from current defaults; unknown fields are rejected.
 
 ### 19.5 Device enumeration and CUDA selection
 
@@ -1100,12 +1250,14 @@ Canvas zoom controls are **Fit**, **100%**, `-`, `+`; the zoom indicator has fix
 Current top-level menus:
 
 - **File** - Open images, Open recent, Close selected, Close all, Export selected, Export all, Exit;
-- **Edit** - Copy editing settings from selected, Paste editing settings to selected;
+- **Edit** - Copy editing settings from selected, Paste editing settings to selected, Essential editing settings;
 - **Select** - Select all (`Ctrl+A`), Deselect all (`Ctrl+Shift+A`);
 - **View** - Zoom to fit, Zoom to 100%, Single view, Split view, Side by side view;
 - **Help** - About.
 
 Copy is enabled when exactly one selected image is activated and uses that image as the settings source. Paste applies the copied numeric/boolean editing recipe to **all selected images**, including inactive ones, and activates those targets. Image-specific painted masks are not copied.
+
+**Essential editing settings** is a checkable item, on by default, whose state persists between sessions. See section 20.
 
 ### 19.8 Export semantics
 
@@ -1156,7 +1308,62 @@ The About dialog is text-only and identifies:
 
 ---
 
-## 20. GUI development and Windows build
+## 20. Essential editing settings (beta)
+
+When an image is imported and the **Edit -> Essential editing settings** item is checked, Flicker Suppressor analyses the image and fills in the settings that must be correct before any other tuning is meaningful:
+
+- `band_axis` - the band direction;
+- `flat_profile` - whether the residual profile stage runs;
+- `flat_profile_mode` - which waveform mode it uses;
+- `flat_profile_band_period` - the band period.
+
+Nothing else is touched. Strengths, pass counts and safety thresholds keep their defaults.
+
+**Scope and status.** This feature is beta. It determines four settings out of roughly 120, and a successful analysis does not mean the image is restored - it points the correction at the right frequency on the right axis, which is where most failures originate, and leaves the rest to you. The settings it does not estimate are the ones that decide how far a correction pushes, and those depend on judgement about the individual image rather than on any measurement the analysis can make.
+
+### 20.1 How the period is measured
+
+The analysis does not measure the band on luminance alone. Scene structure - reflectance, shading, geometry - is multiplicative and affects all three colour channels in proportion, so it largely cancels in a **log-channel ratio** such as `log B - log R`. A flicker source whose spectrum differs from the ambient light does not cancel. The band therefore stands out far more clearly in a ratio than in luminance, and periods that luminance reports as a harmonic of the true value are frequently resolved correctly.
+
+Candidates are found from the two-dimensional spectrum rather than a one-dimensional row profile. A genuine rolling-shutter band is constant along its own axis, so it appears as a peak on the `fx = 0` axis; scene structure is not confined there. Peak height is compared against the local noise floor in the same frequency range, which separates a real band from texture that happens to have similar spacing.
+
+### 20.2 Confidence
+
+Each candidate is measured across several search windows and several channel ratios. A period that changes when the search window changes is a harmonic-family artifact rather than a measurement.
+
+- **high** - ratios agree, windows agree, the band is well above the noise floor, and the cycle count is workable;
+- **medium** - a clear winner with partial agreement, or a greyscale image;
+- **low** - the evidence is weak or contradictory.
+
+The agreement rule is strict on purpose. It will decline on some images it could have handled rather than risk a confident wrong answer, because a wrong period applied at full strength does more damage than no correction at all.
+
+Greyscale images are capped at **medium**. With no colour ratios available there is no second opinion to check luminance against, and window stability alone cannot detect that luminance is the wrong instrument for a particular image.
+
+### 20.3 Band axis
+
+The analysis does **not** choose the band axis by measurement. It uses the existing aspect-ratio prior and estimates the period on that axis. Scoring both axes by band strength was tested and proved unreliable: structure elongated along one direction can outscore a real band. When the other axis scores substantially higher, that is reported as a hint rather than acted on.
+
+### 20.4 What the user sees
+
+While the analysis runs the window is covered by a progress overlay. Dragging further images onto the canvas or the filmstrip still works, so more images can be queued while the first batch is analysed.
+
+A high- or medium-confidence result is applied to that image's settings, and the panel refreshes if the image is currently displayed. Images already edited or mid-render are left alone.
+
+A low-confidence result resets that image to defaults and shows a notice the first time it is selected. The reset is deliberate: leaving the panel untouched would silently carry the previous image's period onto a new one, which is worse than starting from defaults.
+
+### 20.5 Command line
+
+```powershell
+python .\autosettings.py --input .\photo.jpg --json .\photo.settings.json
+```
+
+Without `--base`, the JSON contains the estimated keys plus a diagnostics block including every candidate period and the per-ratio measurements. With `--base defaults.json` the estimate is merged into a complete recipe ready for `hybrid_infer_detail_preserving.py`. The exit code is `2` when confidence is too low to use, so scripts can branch on it.
+
+`--suite DIR` analyses a folder and prints one line per image; `--axis` overrides the aspect-ratio prior.
+
+---
+
+## 21. GUI development and Windows build
 
 ### Development launcher
 
@@ -1197,4 +1404,4 @@ For distribution, the portable release should include `LICENSE` and `RELEASE-LIC
 
 ---
 
-*Last Updated: 17 August 2026*
+*Last Updated: 24 August 2026*

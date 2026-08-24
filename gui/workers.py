@@ -27,6 +27,30 @@ class InferenceWorker(QRunnable):
             self.signals.error.emit(self.task_id,traceback.format_exc())
 
 
+class AutoSettingsWorker(QRunnable):
+    """Estimate band settings for one image, off the UI thread.
+
+    Runs numpy/scipy only -- no torch, no GPU -- so it is safe to queue one per
+    image during a large import. Failures are reported rather than raised: a
+    broken estimate must never stop an image from being imported.
+    """
+
+    def __init__(self, doc_id: str, src: Path):
+        super().__init__()
+        self.doc_id = str(doc_id)
+        self.src = Path(src)
+        self.signals = WorkerSignals()
+
+    @Slot()
+    def run(self):
+        try:
+            from autosettings import estimate
+            result = estimate(self.src)
+            self.signals.finished.emit(self.doc_id, str(self.src), result)
+        except Exception:
+            self.signals.error.emit(self.doc_id, traceback.format_exc())
+
+
 class CopyWorker(QRunnable):
     """Cancelable, atomic file copy used by GUI exports.
 

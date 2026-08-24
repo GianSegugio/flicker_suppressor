@@ -1,0 +1,22 @@
+{
+  "_README": [
+    "Pinned band axis and period for regression measurement.",
+    "period_px is in ORIGINAL image pixels; bandmetrics.py scales it internally.",
+    "",
+    "WHY PINS: re-detecting the period on every run means the metric can move",
+    "because DETECTION moved, not because the tool changed. A regression harness",
+    "must be deterministic. Auto-detection got 10 of 22 images wrong in the first",
+    "baseline run, including jDOn4whY... (wrong axis entirely).",
+    "",
+    "tier: 'target'  = should improve after P1+P2+P3b",
+    "      'guard'   = must NOT regress (period peak is wide; insensitive by design)",
+    "      'unresolved' = no single period resolvable; EXCLUDED from pass/fail",
+    "",
+    "Verified by: harmonic-family spectrum, autocorrelation, per-strip agreement,",
+    "and demodulated SNR against control frequencies at 0.80x/1.20x."
+  ],
+
+  "pins": {
+    
+  }
+}

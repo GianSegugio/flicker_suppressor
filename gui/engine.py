@@ -11,7 +11,7 @@ from band_axis import decide_band_axis, orient_for_processing, restore_display_o
 from chroma_branch_model import build_chroma_branch
 from color_space import rgb_to_y_cbcr, y_cbcr_to_rgb_preserve_y
 from flat_region_filter import apply_flat_region_filter
-from hybrid_infer_detail_preserving import apply_highlight_recovery, run_pass, run_orthogonal_profile_cleanup, save_rgb, to_tensor
+from hybrid_infer_detail_preserving import run_pass, run_orthogonal_profile_cleanup, save_rgb, to_tensor
 from restormer_model import build_single_image_restormer, choose_device, load_state_dict_file, strict_load
 from .settings_schema import namespace
 
@@ -67,7 +67,11 @@ class FlickerEngine:
         args = namespace(settings)
         with self._lock:
             self._check(cancel_event)
-            device = self._ensure_models(str(args.device), callback)
+            if args.restormer:
+                device = self._ensure_models(str(args.device), callback)
+            else:
+                device = choose_device(str(args.device))
+                self._log(callback, "Restormer disabled")
             amp = bool(args.amp and device.type == "cuda")
             with Image.open(src) as im:
                 original = to_tensor(im)
@@ -87,11 +91,12 @@ class FlickerEngine:
                 stage_masks[stage]=orient_for_processing(display_mask,axis.axis).to(device)
             current = source_oriented.clone()
             infos = []
-            for pass_index in range(1, args.passes + 1):
-                self._check(cancel_event)
-                self._log(callback, f"Neural pass {pass_index}/{args.passes}")
-                current, info, _domain = run_pass(current, luma=self._luma, chroma=self._chroma, device=device, amp=amp, args=args, pass_index=pass_index)
-                infos.append(info)
+            if args.restormer:
+                for pass_index in range(1, args.passes + 1):
+                    self._check(cancel_event)
+                    self._log(callback, f"Neural pass {pass_index}/{args.passes}")
+                    current, info, _domain = run_pass(current, luma=self._luma, chroma=self._chroma, device=device, amp=amp, args=args, pass_index=pass_index)
+                    infos.append(info)
 
             flat_stats = None
             cleanup_enabled = bool(args.flat_filter or args.flat_profile or args.flat_surface_equalizer)
@@ -99,10 +104,30 @@ class FlickerEngine:
                 self._check(cancel_event)
                 self._log(callback, "Residual cleanup")
                 final_y, final_c = rgb_to_y_cbcr(current.float())
-                last = infos[-1]
+                broad_neural_gain_hint = None
+                broad_neural_chroma_hint = None
+                cleanup_luma_hint = infos[-1].field if infos else None
+                cleanup_chroma_hint = infos[-1].chroma_delta if infos else None
+                needs_cumulative_hint = bool(
+                    (args.flat_profile and args.flat_profile_mode == "pwm")
+                    or (args.flat_surface_equalizer and args.flat_surface_equalizer_mode == "consensus")
+                )
+                if needs_cumulative_hint and args.restormer:
+                    source_y_for_cleanup, source_c_for_cleanup = rgb_to_y_cbcr(source_oriented.float())
+                    cumulative_luma_hint = torch.log(
+                        (final_y.float().clamp_min(0.0) + float(args.luma_eps))
+                        / (source_y_for_cleanup.float().clamp_min(0.0) + float(args.luma_eps))
+                    )
+                    cumulative_chroma_hint = final_c.float() - source_c_for_cleanup.float()
+                    if args.flat_profile and args.flat_profile_mode == "pwm":
+                        cleanup_luma_hint = cumulative_luma_hint
+                        cleanup_chroma_hint = cumulative_chroma_hint
+                    if args.flat_surface_equalizer and args.flat_surface_equalizer_mode == "consensus":
+                        broad_neural_gain_hint = cumulative_luma_hint
+                        broad_neural_chroma_hint = cumulative_chroma_hint
                 final_y, final_c, _mask, flat_stats = apply_flat_region_filter(
                     final_y, final_c,
-                    luma_field=last.field, chroma_delta_hint=last.chroma_delta,
+                    luma_field=cleanup_luma_hint, chroma_delta_hint=cleanup_chroma_hint,
                     band_period_px=(args.flat_band_period if args.flat_filter else 0.0),
                     period_sigma_ratio=args.flat_period_sigma_ratio,
                     coherence_sigma_x=args.flat_horizontal_sigma,
@@ -131,7 +156,12 @@ class FlickerEngine:
                     local_application_horizontal_sigma=args.flat_local_application_horizontal_sigma,
                     residual_profile_luma_strength=(args.flat_profile_luma_strength if args.flat_profile else 0.0),
                     residual_profile_chroma_strength=(args.flat_profile_chroma_strength if args.flat_profile else 0.0),
+                    residual_profile_mode=args.flat_profile_mode,
                     residual_profile_narrow_ratio=args.flat_profile_narrow_ratio,
+                    residual_profile_pwm_transition_ratio=args.flat_profile_pwm_transition_ratio,
+                    residual_profile_pwm_min_duty=args.flat_profile_pwm_min_duty,
+                    residual_profile_pwm_max_duty=args.flat_profile_pwm_max_duty,
+                    residual_profile_pwm_min_transition_score=args.flat_profile_pwm_min_transition_score,
                     residual_profile_base_ratio=args.flat_profile_base_ratio,
                     residual_profile_band_period_px=args.flat_profile_band_period,
                     period_mode=args.flat_profile_period_mode,
@@ -147,7 +177,11 @@ class FlickerEngine:
                     residual_profile_adaptive_corr_high=args.flat_profile_adaptive_corr_high,
                     residual_profile_adaptive_max_gain=args.flat_profile_adaptive_max_gain,
                     residual_profile_no_harm=args.flat_profile_no_harm,
+                    residual_profile_pwm_polish=args.flat_profile_pwm_polish,
+                    residual_profile_pwm_polish_strength=args.flat_profile_pwm_polish_strength,
+                    residual_profile_pwm_polish_passes=args.flat_profile_pwm_polish_passes,
                     surface_equalizer_enabled=args.flat_surface_equalizer,
+                    surface_equalizer_mode=args.flat_surface_equalizer_mode,
                     surface_equalizer_luma_strength=args.flat_surface_equalizer_luma_strength,
                     surface_equalizer_chroma_strength=args.flat_surface_equalizer_chroma_strength,
                     surface_equalizer_poly_degree=args.flat_surface_equalizer_degree,
@@ -164,6 +198,14 @@ class FlickerEngine:
                     surface_equalizer_row_sigma=args.flat_surface_equalizer_row_sigma,
                     surface_equalizer_huber_k=args.flat_surface_equalizer_huber_k,
                     surface_equalizer_min_coverage=args.flat_surface_equalizer_min_coverage,
+                    broad_consensus_regions=args.flat_broad_consensus_regions,
+                    broad_consensus_min_regions=args.flat_broad_consensus_min_regions,
+                    broad_consensus_corr_low=args.flat_broad_consensus_corr_low,
+                    broad_consensus_corr_high=args.flat_broad_consensus_corr_high,
+                    broad_consensus_smooth_fraction=args.flat_broad_consensus_smooth_fraction,
+                    broad_consensus_baseline_fraction=args.flat_broad_consensus_baseline_fraction,
+                    broad_neural_gain_hint=broad_neural_gain_hint,
+                    broad_neural_chroma_hint=broad_neural_chroma_hint,
                     local_user_mask=stage_masks.get('flat'),
                     profile_user_mask=stage_masks.get('profile'),
                     surface_user_mask=stage_masks.get('broad'),
@@ -188,15 +230,6 @@ class FlickerEngine:
                     current=orthogonal_out
 
             self._check(cancel_event)
-            if args.highlight_recovery_strength > 0:
-                self._log(callback, "Highlight recovery")
-            current, _highlight_stats = apply_highlight_recovery(
-                current, source_oriented,
-                strength=args.highlight_recovery_strength,
-                start=args.highlight_recovery_start,
-                full=args.highlight_recovery_full,
-            )
-
             self._check(cancel_event)
             display = restore_display_orientation(current, axis.axis)
             save_rgb(display.squeeze(0), Path(dst))

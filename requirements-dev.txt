@@ -1,0 +1,8 @@
+# Development / regression-testing only.
+#
+# Do NOT add these to requirements.txt. The shipped application does not import
+# scipy, and pulling it into the Nuitka standalone build would inflate the
+# portable folder for no runtime benefit.
+#
+# Needed by: bandmetrics.py, bench.py, prototype_pwm_suppressor.py
+scipy>=1.11
