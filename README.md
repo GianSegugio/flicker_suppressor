@@ -27,6 +27,16 @@ It is **not** intended as a general JPEG-debander, posterization remover, moire 
 
 ## System requirements
 
+### Dependencies
+
+- Python >= v3.12
+- [**Microsoft Visual Studio 2022 Build Tools**](https://visualstudio.microsoft.com/vs/older-downloads/?utm_source=chatgpt.com)
+
+In the Microsoft Visual Studio 2022 Build Tools installer, select Desktop development with C++ and make sure these components are included:
+- MSVC v143 - VS 2022 C++ x64/x86 build tools
+- Windows 11 SDK — the newest offered version is fine
+- C++ core/build tools
+
 ### Tested configuration
 
 The current release has been developed and validated primarily on Windows 11 25H2 with:
@@ -359,4 +369,4 @@ Restormer:
 
 ---
 
-*Last Updated: 24 August 2026*
+*Last Updated: 25 August 2026*
