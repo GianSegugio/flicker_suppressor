@@ -27,7 +27,11 @@ It is **not** intended as a general JPEG-debander, posterization remover, moire 
 
 ## System requirements
 
-### Dependencies
+### Runtime dependencies
+
+- *none*
+
+### Build dependencies
 
 - Python >= v3.12
 - [**Microsoft Visual Studio 2022 Build Tools**](https://visualstudio.microsoft.com/vs/older-downloads/?utm_source=chatgpt.com)
