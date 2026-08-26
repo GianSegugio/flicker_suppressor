@@ -31,7 +31,7 @@ It is **not** intended as a general JPEG-debander, posterization remover, moire 
 
 - *none*
 
-### Build dependencies
+### Windows build dependencies
 
 - Python >= v3.12
 - [**Microsoft Visual Studio 2022 Build Tools**](https://visualstudio.microsoft.com/vs/older-downloads/?utm_source=chatgpt.com)
@@ -57,7 +57,9 @@ A recent NVIDIA driver is required for CUDA GPU mode. CPU mode is supported but 
 
 The portable Windows build produced by `build_windows.ps1` bundles Python, Qt/PySide6, PyTorch, the model files, and the required runtime libraries; an end user of that standalone folder does not need a separate Python or Qt installation.
 
-## Desktop GUI dev mode
+## GUI development and Windows build
+
+### Desktop GUI dev mode
 
 For source/development use on Windows:
 
@@ -70,7 +72,7 @@ The launcher creates `.venv-gui` when needed, installs the tested CUDA PyTorch b
 
 On startup, Flicker Suppressor shows a lightweight centered splash before importing the heavier GUI/PyTorch/CUDA application modules. It uses the application logo with a separate bold white **`loading...`** label below it and a blurred dark text shadow for readability over bright desktop content. The splash has no artificial minimum duration and closes as soon as the main window is ready.
 
-## Build
+### Build
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
@@ -373,4 +375,4 @@ Restormer:
 
 ---
 
-*Last Updated: 25 August 2026*
+*Last Updated: 26 August 2026*
